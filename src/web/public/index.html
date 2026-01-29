@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spellbook - Mission Control</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- xterm.js for terminal emulation -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            spellbook: {
+              bg: '#0a0a0f',
+              card: '#14141f',
+              border: '#1f1f2e',
+              accent: '#00ff88',
+              text: '#e0e0e0',
+              muted: '#666680',
+            }
+          },
+          fontFamily: {
+            mono: ['Space Mono', 'Menlo', 'Monaco', 'monospace'],
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="dark bg-spellbook-bg text-spellbook-text font-mono min-h-screen">
+  <div id="app" class="flex flex-col h-screen">
+
+    <!-- Header -->
+    <header class="border-b border-spellbook-border px-4 py-2 flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <h1 class="text-lg font-bold text-spellbook-accent">SPELLBOOK</h1>
+        <select id="project-selector" class="bg-spellbook-card border border-spellbook-border rounded px-3 py-1 text-sm">
+          <option value="">Loading...</option>
+        </select>
+        <span id="branch-display" class="text-xs text-spellbook-muted px-2 py-1 bg-spellbook-card rounded">
+          branch: loading...
+        </span>
+        <div class="relative">
+          <button onclick="toggleKnowledgeBase()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent flex items-center gap-2">
+            <span>📚</span> Knowledge Base <span id="kb-toggle" class="text-xs">▼</span>
+          </button>
+          <div id="knowledge-base" class="hidden absolute top-full left-0 mt-1 bg-spellbook-card border border-spellbook-border rounded-lg shadow-xl z-50 min-w-[250px] max-h-[400px] overflow-hidden">
+            <div class="p-2 border-b border-spellbook-border text-xs text-spellbook-muted">Project Documentation</div>
+            <div id="kb-list" class="max-h-[350px] overflow-y-auto"></div>
+          </div>
+        </div>
+        <!-- View Toggle -->
+        <div class="flex gap-1 ml-4">
+          <button onclick="switchMainView('dashboard')" id="view-dashboard-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
+            Dashboard
+          </button>
+          <button onclick="switchMainView('kanban')" id="view-kanban-btn" class="px-3 py-1 text-sm bg-spellbook-accent/20 text-spellbook-accent rounded">
+            Kanban
+          </button>
+          <button onclick="switchMainView('inbox')" id="view-inbox-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
+            Inbox <span id="inbox-badge" class="ml-1 px-1.5 py-0.5 bg-yellow-500/30 text-yellow-400 text-xs rounded-full">0</span>
+          </button>
+          <button onclick="switchMainView('investigate')" id="view-investigate-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
+            Investigate
+          </button>
+          <button onclick="switchMainView('terminals')" id="view-terminals-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
+            Terminal Manager
+          </button>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="quickLog('bug')" class="px-3 py-1 bg-red-500/20 text-red-400 rounded text-sm hover:bg-red-500/30">
+          + Bug
+        </button>
+        <button onclick="quickLog('improvement')" class="px-3 py-1 bg-blue-500/20 text-blue-400 rounded text-sm hover:bg-blue-500/30">
+          + Improvement
+        </button>
+        <button onclick="quickLog('feature')" class="px-3 py-1 bg-purple-500/20 text-purple-400 rounded text-sm hover:bg-purple-500/30">
+          + Feature
+        </button>
+        <button onclick="quickAddIdea()" class="px-3 py-1 bg-yellow-500/20 text-yellow-400 rounded text-sm hover:bg-yellow-500/30">
+          + Idea
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 flex flex-col overflow-hidden">
+
+      <!-- DASHBOARD VIEW -->
+      <div id="dashboard-view" class="flex-1 flex-col overflow-hidden hidden">
+        <!-- Dashboard Header -->
+        <div class="px-6 py-4 border-b border-spellbook-border">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 id="dashboard-project-name" class="text-xl font-bold text-spellbook-accent">Project Dashboard</h2>
+              <div id="dashboard-git-info" class="text-sm text-spellbook-muted mt-1">Loading...</div>
+            </div>
+            <div class="flex items-center gap-4">
+              <button onclick="refreshDashboard()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent">
+                ↻ Refresh
+              </button>
+              <span id="dashboard-updated" class="text-xs text-spellbook-muted"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-1 flex overflow-hidden">
+          <!-- Left: Stats & Info -->
+          <div class="w-1/3 border-r border-spellbook-border overflow-y-auto p-4">
+            <!-- Quick Stats -->
+            <div class="mb-6">
+              <h3 class="text-sm font-semibold text-spellbook-muted mb-3">PROJECT OVERVIEW</h3>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3">
+                  <div id="stat-features" class="text-2xl font-bold text-spellbook-accent">-/-</div>
+                  <div class="text-xs text-spellbook-muted">Features Complete</div>
+                </div>
+                <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3">
+                  <div id="stat-bugs" class="text-2xl font-bold text-red-400">-</div>
+                  <div class="text-xs text-spellbook-muted">Active Bugs</div>
+                </div>
+                <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3">
+                  <div id="stat-improvements" class="text-2xl font-bold text-blue-400">-</div>
+                  <div class="text-xs text-spellbook-muted">Improvements</div>
+                </div>
+                <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3">
+                  <div id="stat-inbox" class="text-2xl font-bold text-purple-400">-</div>
+                  <div class="text-xs text-spellbook-muted">Inbox Items</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tech Stack -->
+            <div class="mb-6">
+              <h3 class="text-sm font-semibold text-spellbook-muted mb-3">TECH STACK</h3>
+              <div id="tech-stack-list" class="bg-spellbook-card border border-spellbook-border rounded-lg p-3">
+                <div class="text-spellbook-muted text-sm">Loading...</div>
+              </div>
+            </div>
+
+            <!-- Project Path -->
+            <div>
+              <h3 class="text-sm font-semibold text-spellbook-muted mb-3">PROJECT PATH</h3>
+              <div id="project-path" class="bg-spellbook-card border border-spellbook-border rounded-lg p-3 text-xs font-mono text-spellbook-muted break-all">
+                Loading...
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Roadmap Content -->
+          <div class="w-2/3 flex flex-col overflow-hidden">
+            <div class="px-4 py-2 border-b border-spellbook-border flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="text-sm font-semibold">📋 ROADMAP</span>
+                <span class="text-xs text-spellbook-muted">(auto-generated)</span>
+              </div>
+              <span id="roadmap-modified" class="text-xs text-spellbook-muted"></span>
+            </div>
+            <div id="roadmap-content" class="flex-1 overflow-auto p-4 prose prose-invert max-w-none">
+              <div class="text-center text-spellbook-muted py-8">Loading roadmap...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- INVESTIGATE VIEW -->
+      <div id="investigate-view" class="flex-1 flex-col overflow-hidden hidden">
+        <!-- Investigation Header -->
+        <div class="px-6 py-4 border-b border-spellbook-border">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-xl font-bold text-spellbook-accent">Investigate</h2>
+              <div class="text-sm text-spellbook-muted mt-1">Research the codebase or hunt for bugs</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="startNewInvestigation('research')" class="px-4 py-2 bg-blue-500/20 text-blue-400 rounded hover:bg-blue-500/30">
+                🔍 Codebase Research
+              </button>
+              <button onclick="startNewInvestigation('bug')" class="px-4 py-2 bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
+                🐛 Bug Hunt
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-1 flex overflow-hidden">
+          <!-- Left: Investigation Sessions -->
+          <div class="w-1/3 border-r border-spellbook-border overflow-y-auto">
+            <div class="p-4">
+              <h3 class="text-sm font-semibold text-spellbook-muted mb-3">ACTIVE INVESTIGATIONS</h3>
+              <div id="investigation-sessions" class="space-y-2">
+                <div class="text-center text-spellbook-muted py-8 text-sm">
+                  No active investigations. Start one above.
+                </div>
+              </div>
+            </div>
+
+            <!-- Quick Question -->
+            <div class="p-4 border-t border-spellbook-border">
+              <h3 class="text-sm font-semibold text-spellbook-muted mb-3">QUICK QUESTION</h3>
+              <textarea id="quick-question-input" class="w-full bg-spellbook-card border border-spellbook-border rounded p-3 text-sm resize-none h-24 focus:border-spellbook-accent outline-none" placeholder="Ask a question about the codebase..."></textarea>
+              <button onclick="askQuickQuestion()" class="mt-2 w-full px-4 py-2 bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30 text-sm">
+                Ask Question
+              </button>
+            </div>
+          </div>
+
+          <!-- Right: Investigation Terminal -->
+          <div class="w-2/3 flex flex-col">
+            <div class="px-4 py-2 border-b border-spellbook-border flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span id="investigation-title" class="text-sm font-semibold text-spellbook-muted">Select or start an investigation</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button onclick="closeInvestigation()" id="close-investigation-btn" class="px-2 py-1 text-xs bg-red-500/20 text-red-400 rounded hover:bg-red-500/30 hidden">
+                  Close
+                </button>
+                <span id="investigation-status" class="text-xs text-spellbook-muted">No active investigation</span>
+              </div>
+            </div>
+            <div id="investigation-terminal" class="flex-1 bg-[#0a0a0f]">
+              <div class="flex items-center justify-center h-full text-spellbook-muted">
+                <div class="text-center">
+                  <div class="text-4xl mb-4">🔍</div>
+                  <div class="text-lg mb-2">Start an Investigation</div>
+                  <div class="text-sm text-spellbook-muted">Click "Codebase Research" or "Bug Hunt" to begin</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- INBOX VIEW -->
+      <div id="inbox-view" class="flex-1 flex-col overflow-hidden hidden">
+        <!-- Inbox Header -->
+        <div class="px-6 py-4 border-b border-spellbook-border">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-xl font-bold text-yellow-400">💡 Ideas Inbox</h2>
+              <div class="text-sm text-spellbook-muted mt-1">Quick-captured ideas waiting to be planned</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="quickAddIdea()" class="px-4 py-2 bg-yellow-500/20 text-yellow-400 rounded hover:bg-yellow-500/30">
+                + Add Idea
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-1 flex overflow-hidden">
+          <!-- Left: Inbox Items List -->
+          <div class="w-2/3 border-r border-spellbook-border overflow-y-auto p-4">
+            <div class="flex items-center justify-between mb-4">
+              <div class="flex gap-2">
+                <button onclick="setInboxFilter('all')" class="inbox-filter active px-3 py-1 text-xs rounded" data-filter="all">All</button>
+                <button onclick="setInboxFilter('feature')" class="inbox-filter px-3 py-1 text-xs rounded" data-filter="feature">Features</button>
+                <button onclick="setInboxFilter('improvement')" class="inbox-filter px-3 py-1 text-xs rounded" data-filter="improvement">Improvements</button>
+                <button onclick="setInboxFilter('bug')" class="inbox-filter px-3 py-1 text-xs rounded" data-filter="bug">Bugs</button>
+              </div>
+              <span id="inbox-count" class="text-xs text-spellbook-muted">0 ideas</span>
+            </div>
+            <div id="inbox-items-list" class="space-y-3">
+              <div class="text-center text-spellbook-muted py-8">No ideas in inbox</div>
+            </div>
+          </div>
+
+          <!-- Right: Selected Idea Detail + Actions -->
+          <div class="w-1/3 flex flex-col">
+            <div class="px-4 py-3 border-b border-spellbook-border">
+              <span class="text-sm font-semibold">Idea Details</span>
+            </div>
+            <div id="inbox-detail-panel" class="flex-1 overflow-y-auto p-4">
+              <div class="text-center text-spellbook-muted py-8">
+                <div class="text-4xl mb-4">💡</div>
+                <div>Select an idea to view details</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- KANBAN VIEW (Default) -->
+      <div id="kanban-view" class="flex-1 flex overflow-hidden">
+        <!-- LEFT: Kanban Board (2/3) -->
+        <div id="kanban-panel" class="w-2/3 border-r border-spellbook-border flex flex-col">
+          <!-- Kanban Header -->
+          <div class="px-4 py-2 border-b border-spellbook-border flex items-center justify-between">
+            <div class="flex items-center gap-4">
+              <span class="text-sm font-semibold">Kanban Board</span>
+              <!-- Type Filter -->
+              <div class="flex gap-1">
+                <button onclick="setKanbanFilter('all')" class="kanban-filter active" data-filter="all">All</button>
+                <button onclick="setKanbanFilter('bug')" class="kanban-filter" data-filter="bug">Bugs</button>
+                <button onclick="setKanbanFilter('improvement')" class="kanban-filter" data-filter="improvement">Improvements</button>
+                <button onclick="setKanbanFilter('feature')" class="kanban-filter" data-filter="feature">Features</button>
+              </div>
+              <!-- Priority Filter -->
+              <select id="priority-filter" onchange="setKanbanPriorityFilter(this.value)" class="bg-spellbook-card border border-spellbook-border rounded px-2 py-1 text-xs">
+                <option value="all">All Priorities</option>
+                <option value="high">High Only</option>
+                <option value="medium">Medium Only</option>
+                <option value="low">Low Only</option>
+              </select>
+              <!-- Sort -->
+              <select id="kanban-sort" onchange="setKanbanSort(this.value)" class="bg-spellbook-card border border-spellbook-border rounded px-2 py-1 text-xs">
+                <option value="priority">By Priority</option>
+                <option value="newest">Newest First</option>
+                <option value="oldest">Oldest First</option>
+                <option value="number">By Number</option>
+              </select>
+            </div>
+            <span id="kanban-count" class="text-xs text-spellbook-muted"></span>
+          </div>
+
+          <!-- Kanban Columns -->
+          <div class="flex-1 flex gap-2 p-3 overflow-x-auto min-h-0">
+            <!-- BACKLOG Column -->
+            <div class="kanban-column flex-1 min-w-[180px]">
+              <div class="kanban-column-header">
+                <span>BACKLOG</span>
+                <span id="backlog-count" class="kanban-count">0</span>
+              </div>
+              <div id="backlog-items" class="kanban-items" data-status="active,spec_draft"></div>
+            </div>
+
+            <!-- PLANNING Column -->
+            <div class="kanban-column flex-1 min-w-[180px]">
+              <div class="kanban-column-header">
+                <span>PLANNING</span>
+                <span id="planning-count" class="kanban-count">0</span>
+              </div>
+              <div id="planning-items" class="kanban-items" data-status="planning,spec_ready"></div>
+            </div>
+
+            <!-- IN PROGRESS Column -->
+            <div class="kanban-column flex-1 min-w-[180px]">
+              <div class="kanban-column-header">
+                <span>IN PROGRESS</span>
+                <span id="progress-count" class="kanban-count">0</span>
+              </div>
+              <div id="progress-items" class="kanban-items" data-status="in_progress"></div>
+            </div>
+
+            <!-- DONE Column -->
+            <div class="kanban-column flex-1 min-w-[180px]">
+              <div class="kanban-column-header">
+                <span>DONE</span>
+                <span id="done-count" class="kanban-count">0</span>
+              </div>
+              <div id="done-items" class="kanban-items" data-status="resolved,completed,complete"></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- RIGHT: Quick Chat + Recent Activity (1/3) -->
+        <div id="quick-chat-panel" class="w-1/3 flex flex-col">
+          <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
+            <span class="text-sm font-semibold">Quick Chat</span>
+            <span class="text-xs text-spellbook-muted">For rapid logging</span>
+          </div>
+          <div id="quick-chat-terminal" class="flex-1 bg-[#0a0a0f]"></div>
+
+          <!-- Recent Activity -->
+          <div class="border-t border-spellbook-border flex flex-col" style="height: 280px;">
+            <div class="px-3 py-2 flex items-center justify-between bg-spellbook-card border-b border-spellbook-border">
+              <span class="text-xs font-semibold text-spellbook-muted">RECENT ACTIVITY</span>
+              <span id="activity-count" class="text-xs text-spellbook-muted"></span>
+            </div>
+            <div id="recent-activity-list" class="flex-1 overflow-y-auto">
+              <div class="text-xs text-spellbook-muted p-2">Loading activity...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TERMINAL MANAGER VIEW (Hidden by default) -->
+      <div id="terminal-manager-view" class="flex-1 flex-col overflow-hidden hidden">
+        <!-- Active Sessions Grid -->
+        <div class="p-4 border-b border-spellbook-border">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-semibold">Active Sessions</span>
+            <button onclick="closeAllIdleSessions()" class="text-xs text-spellbook-muted hover:text-red-400">
+              Close All Idle
+            </button>
+          </div>
+          <div id="sessions-grid" class="grid grid-cols-3 gap-3">
+            <!-- Session cards rendered here -->
+            <div class="text-center text-spellbook-muted py-8 col-span-3">
+              No active sessions. Click an item on the Kanban board to start planning.
+            </div>
+          </div>
+        </div>
+
+        <!-- Document Viewer for Selected Session -->
+        <div class="flex-1 flex flex-col overflow-hidden">
+          <div class="px-4 py-2 border-b border-spellbook-border flex items-center gap-4">
+            <span id="tm-selected-item" class="text-sm text-spellbook-muted">Select a session to view document</span>
+            <div id="tm-doc-tabs" class="flex gap-2 hidden">
+              <button onclick="setTMDocTab('document')" class="tm-doc-tab active px-2 py-1 text-xs rounded" data-tab="document">Document</button>
+              <button onclick="setTMDocTab('changelog')" class="tm-doc-tab px-2 py-1 text-xs rounded" data-tab="changelog">Changelog</button>
+            </div>
+          </div>
+          <div id="tm-document-viewer" class="flex-1 overflow-auto p-4">
+            <div class="text-center text-spellbook-muted py-8">
+              Select a session above to view its documentation.
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+
+    <!-- Session Status Bar -->
+    <div id="session-status-bar" class="border-t border-spellbook-border px-4 py-1 flex items-center gap-2 overflow-x-auto">
+      <span class="text-xs text-spellbook-muted mr-2">SESSIONS:</span>
+      <div id="session-pills" class="flex gap-2">
+        <!-- Session pills rendered here -->
+      </div>
+      <div class="flex-1"></div>
+      <span id="stats-summary" class="text-xs text-spellbook-muted"></span>
+    </div>
+
+    <!-- Activity Bar (Bottom) -->
+    <footer class="border-t border-spellbook-border px-4 py-1 flex items-center justify-between text-xs">
+      <div id="activity-feed" class="flex-1 text-spellbook-muted truncate">
+        Ready
+      </div>
+      <div class="flex items-center gap-4">
+        <button onclick="toggleWorktrees()" class="text-spellbook-muted hover:text-white flex items-center gap-1">
+          WORKTREES <span id="worktree-toggle">▼</span>
+        </button>
+      </div>
+    </footer>
+
+    <!-- Worktrees Dropdown -->
+    <div id="worktree-dropdown" class="hidden absolute bottom-12 right-4 bg-spellbook-card border border-spellbook-border rounded-lg shadow-xl p-3 min-w-[300px] max-h-[200px] overflow-auto z-50">
+      <div class="text-xs font-semibold text-spellbook-muted mb-2">Active Worktrees</div>
+      <div id="worktree-list" class="space-y-1"></div>
+    </div>
+  </div>
+
+  <!-- PLANNING VIEW OVERLAY (Fullscreen when open) -->
+  <div id="planning-view" class="fixed inset-0 bg-spellbook-bg z-50 flex flex-col hidden">
+    <!-- Planning View Header -->
+    <div class="border-b border-spellbook-border px-4 py-2 flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <button onclick="minimizePlanningView()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent">
+          ← Minimize
+        </button>
+        <span id="planning-item-ref" class="text-spellbook-accent font-semibold">improvement-32</span>
+        <span id="planning-item-title" class="text-sm truncate max-w-md">Auto-Finalize Tracking for Depleted Pools</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="planning-status-badge" class="px-2 py-1 text-xs rounded bg-blue-500/20 text-blue-400">Planning</span>
+        <!-- Worktree indicator -->
+        <div id="worktree-indicator" class="flex items-center gap-2 px-2 py-1 bg-spellbook-card border border-spellbook-border rounded text-xs">
+          <span id="worktree-icon" class="text-spellbook-muted">🌲</span>
+          <span id="worktree-info" class="text-spellbook-muted">No worktree</span>
+          <button id="worktree-action-btn" onclick="handleWorktreeAction()" class="px-2 py-0.5 bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30 text-xs">
+            Create
+          </button>
+        </div>
+        <button id="close-planning-btn" class="px-3 py-1 text-spellbook-muted hover:text-white relative z-[100]">
+          ✕ Close
+        </button>
+      </div>
+    </div>
+
+    <!-- Planning View Content -->
+    <div class="flex-1 flex overflow-hidden">
+      <!-- LEFT: Document Viewer -->
+      <div class="w-1/2 border-r border-spellbook-border flex flex-col">
+        <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
+          <div class="flex gap-2">
+            <button onclick="setPlanningDocTab('document')" class="planning-doc-tab active px-3 py-1 text-sm rounded" data-tab="document">Document</button>
+            <button onclick="setPlanningDocTab('plan')" class="planning-doc-tab px-3 py-1 text-sm rounded" data-tab="plan">Plan</button>
+            <button onclick="setPlanningDocTab('changelog')" class="planning-doc-tab px-3 py-1 text-sm rounded" data-tab="changelog">Changelog</button>
+            <button onclick="setPlanningDocTab('files')" class="planning-doc-tab px-3 py-1 text-sm rounded" data-tab="files">
+              Files <span id="files-count" class="text-xs text-spellbook-muted ml-1"></span>
+            </button>
+          </div>
+          <div class="flex items-center gap-2">
+            <span id="plan-status-indicator" class="text-xs"></span>
+            <span id="doc-refresh-indicator" class="text-xs text-spellbook-muted">↻ Auto-refreshes</span>
+            <span id="doc-last-modified" class="text-xs text-spellbook-muted"></span>
+          </div>
+        </div>
+        <div id="planning-document-content" class="flex-1 overflow-auto p-4 prose prose-invert max-w-none">
+          Loading document...
+        </div>
+      </div>
+
+      <!-- RIGHT: Terminal -->
+      <div class="w-1/2 flex flex-col">
+        <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <span class="text-sm font-semibold">Terminal</span>
+            <span id="terminal-branch" class="text-xs px-2 py-0.5 bg-purple-500/20 text-purple-400 rounded font-mono">branch: loading...</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-spellbook-muted">type /exit to return to bash</span>
+            <button onclick="exitClaudeTerminal()" class="px-2 py-1 text-xs bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
+              Exit Claude
+            </button>
+            <span id="terminal-status" class="text-xs text-green-400">● Connected</span>
+          </div>
+        </div>
+        <div id="planning-terminal" class="flex-1 bg-[#0a0a0f]"></div>
+      </div>
+    </div>
+
+    <!-- Planning View Action Bar -->
+    <div class="border-t border-spellbook-border px-4 py-2 flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <span class="text-xs text-spellbook-muted">Working on: <span id="planning-working-ref" class="text-spellbook-accent">improvement-32</span></span>
+        <!-- Workflow Progress Indicator -->
+        <div id="workflow-progress" class="flex items-center gap-1 text-xs">
+          <span id="wf-step-plan" class="workflow-step px-2 py-0.5 rounded bg-gray-500/20 text-gray-400">Plan</span>
+          <span class="text-spellbook-muted">→</span>
+          <span id="wf-step-impl" class="workflow-step px-2 py-0.5 rounded bg-gray-500/20 text-gray-400">Implement</span>
+          <span class="text-spellbook-muted">→</span>
+          <span id="wf-step-commit" class="workflow-step px-2 py-0.5 rounded bg-gray-500/20 text-gray-400">Commit</span>
+          <span class="text-spellbook-muted">→</span>
+          <span id="wf-step-pr" class="workflow-step px-2 py-0.5 rounded bg-gray-500/20 text-gray-400">PR</span>
+          <span class="text-spellbook-muted">→</span>
+          <span id="wf-step-review" class="workflow-step px-2 py-0.5 rounded bg-gray-500/20 text-gray-400">Review</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="finalizePlanning()" id="finalize-btn" class="px-4 py-2 bg-blue-500/20 text-blue-400 rounded hover:bg-blue-500/30">
+          Finalize Planning ✓
+        </button>
+        <button id="start-impl-btn" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hover:bg-spellbook-accent/80">
+          Start Implementation →
+        </button>
+        <!-- Additional workflow buttons (hidden by default) -->
+        <button id="create-pr-btn" onclick="createPullRequest()" class="hidden px-4 py-2 bg-purple-500 text-white rounded font-semibold hover:bg-purple-600">
+          Create PR →
+        </button>
+        <button id="code-rabbit-btn" onclick="startCodeRabbitReview()" class="hidden px-4 py-2 bg-orange-500 text-white rounded font-semibold hover:bg-orange-600">
+          CodeRabbit Review →
+        </button>
+        <button id="finalize-item-btn" onclick="finalizeItem()" class="hidden px-4 py-2 bg-green-500 text-white rounded font-semibold hover:bg-green-600">
+          Mark Complete ✓
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Item Detail Modal -->
+  <div id="item-detail-modal" class="modal-overlay hidden">
+    <div class="modal-content max-w-5xl max-h-[85vh] flex flex-col">
+      <div class="modal-header">
+        <div class="flex items-center gap-3">
+          <span id="detail-ref" class="text-spellbook-accent font-bold text-lg">bug-44</span>
+          <span id="detail-status-badge" class="px-2 py-1 text-xs rounded bg-gray-500/20 text-gray-400">active</span>
+          <span id="detail-priority-badge" class="px-2 py-1 text-xs rounded">medium</span>
+        </div>
+        <button onclick="hideItemDetailModal()" class="text-spellbook-muted hover:text-white text-2xl">&times;</button>
+      </div>
+      <div class="modal-body flex-1 flex flex-col overflow-hidden">
+        <h2 id="detail-title" class="text-xl font-semibold mb-3">Item Title</h2>
+
+        <!-- Metadata Row -->
+        <div class="flex flex-wrap gap-6 mb-4 text-sm border-b border-spellbook-border pb-4">
+          <div>
+            <span class="text-spellbook-muted">Created:</span>
+            <span id="detail-created" class="ml-2">-</span>
+          </div>
+          <div>
+            <span class="text-spellbook-muted">Updated:</span>
+            <span id="detail-updated" class="ml-2">-</span>
+          </div>
+          <div id="detail-feature-row" class="hidden">
+            <span class="text-spellbook-muted">Linked Feature:</span>
+            <span id="detail-feature" class="ml-2 text-purple-400">-</span>
+          </div>
+          <div id="detail-owner-row" class="hidden">
+            <span class="text-spellbook-muted">Owner:</span>
+            <span id="detail-owner" class="ml-2 text-blue-400">-</span>
+          </div>
+          <div id="detail-docpath-row">
+            <span class="text-spellbook-muted">Doc:</span>
+            <span id="detail-docpath" class="ml-2 text-xs font-mono text-spellbook-muted">-</span>
+          </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="flex gap-2 mb-3">
+          <button onclick="setDetailTab('document')" class="detail-tab active px-4 py-2 text-sm rounded" data-tab="document">
+            📄 Document
+          </button>
+          <button onclick="setDetailTab('changelog')" class="detail-tab px-4 py-2 text-sm rounded" data-tab="changelog">
+            📝 Changelog
+          </button>
+          <button onclick="setDetailTab('files')" class="detail-tab px-4 py-2 text-sm rounded" data-tab="files">
+            📁 Files Changed
+          </button>
+        </div>
+
+        <!-- Tab Content -->
+        <div id="detail-tab-content" class="flex-1 min-h-0 overflow-hidden">
+          <!-- Document Tab -->
+          <div id="detail-document-tab" class="h-full">
+            <div id="detail-doc-content" class="bg-spellbook-bg border border-spellbook-border rounded p-4 prose prose-invert max-w-none h-full max-h-[50vh] overflow-y-auto">
+              Loading...
+            </div>
+          </div>
+          <!-- Changelog Tab -->
+          <div id="detail-changelog-tab" class="h-full hidden">
+            <div id="detail-changelog-content" class="bg-spellbook-bg border border-spellbook-border rounded p-4 prose prose-invert max-w-none h-full max-h-[50vh] overflow-y-auto">
+              Loading...
+            </div>
+          </div>
+          <!-- Files Tab -->
+          <div id="detail-files-tab" class="h-full hidden">
+            <div id="detail-files-content" class="bg-spellbook-bg border border-spellbook-border rounded p-4 h-full max-h-[50vh] overflow-y-auto">
+              <div class="text-spellbook-muted">No files changed listed</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="flex justify-between items-center pt-4 border-t border-spellbook-border mt-4">
+          <div class="flex gap-2">
+            <button onclick="openDocInEditor()" class="px-3 py-2 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
+              📄 Open in Editor
+            </button>
+            <button id="detail-finalize-btn" onclick="quickFinalize()" class="px-3 py-2 text-sm bg-green-500/20 text-green-400 rounded hover:bg-green-500/30 hidden">
+              ✓ Mark Complete
+            </button>
+          </div>
+          <div class="flex gap-2">
+            <button onclick="hideItemDetailModal()" class="px-4 py-2 text-spellbook-muted hover:text-white">
+              Close
+            </button>
+            <button onclick="openPlanningFromModal()" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold">
+              🔧 Work on This
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Work Mode Selection Modal -->
+  <div id="work-mode-modal" class="modal-overlay hidden">
+    <div class="modal-content max-w-md">
+      <div class="modal-header">
+        <div>
+          <h3 class="font-bold text-lg">Start Working</h3>
+          <div id="work-mode-item-ref" class="text-sm text-spellbook-accent font-mono mt-1">improvement-33</div>
+        </div>
+        <button onclick="hideWorkModeModal()" class="text-spellbook-muted hover:text-white text-2xl">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="space-y-4">
+          <!-- Work Mode Options -->
+          <div class="space-y-3">
+            <label class="flex items-start gap-3 p-3 bg-spellbook-card border border-spellbook-border rounded-lg cursor-pointer hover:border-spellbook-accent transition-colors">
+              <input type="radio" name="work-mode" value="develop" class="mt-1" checked>
+              <div>
+                <div class="font-semibold text-sm">Work on develop branch</div>
+                <div class="text-xs text-spellbook-muted mt-1">Open terminal in main project directory. Best for quick fixes or when you want to manage branches yourself.</div>
+              </div>
+            </label>
+            <label class="flex items-start gap-3 p-3 bg-spellbook-card border border-spellbook-border rounded-lg cursor-pointer hover:border-spellbook-accent transition-colors">
+              <input type="radio" name="work-mode" value="worktree" class="mt-1">
+              <div>
+                <div class="font-semibold text-sm">Create new worktree</div>
+                <div class="text-xs text-spellbook-muted mt-1">Create an isolated worktree with its own branch. Best for parallel work or keeping changes separate.</div>
+              </div>
+            </label>
+          </div>
+
+          <!-- Worktree Options (shown when worktree mode selected) -->
+          <div id="worktree-options" class="hidden space-y-3 pt-3 border-t border-spellbook-border">
+            <div>
+              <label class="block text-sm text-spellbook-muted mb-1">Branch Name</label>
+              <input type="text" id="worktree-branch-name" class="w-full bg-spellbook-card border border-spellbook-border rounded px-3 py-2 text-sm font-mono focus:border-spellbook-accent outline-none" placeholder="improvement/33-auto-finalize">
+            </div>
+            <div class="text-xs text-spellbook-muted">
+              Worktree will be created at: <span id="worktree-path-preview" class="font-mono text-spellbook-text">~/.worktrees/project/branch</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-6 pt-4 border-t border-spellbook-border flex justify-end gap-2">
+          <button onclick="hideWorkModeModal()" class="px-4 py-2 text-spellbook-muted hover:text-white">
+            Cancel
+          </button>
+          <button onclick="submitWorkMode()" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hover:bg-spellbook-accent/80">
+            Start Working
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick Log Modal -->
+  <div id="quick-log-modal" class="modal-overlay hidden">
+    <div class="modal-content max-w-lg">
+      <div class="modal-header">
+        <h3 id="quick-log-title" class="font-bold text-lg">Log Bug</h3>
+        <button onclick="hideQuickLogModal()" class="text-spellbook-muted hover:text-white text-2xl">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="space-y-4">
+          <div>
+            <label class="block text-sm text-spellbook-muted mb-1">Title</label>
+            <input type="text" id="quick-log-input" class="w-full bg-spellbook-card border border-spellbook-border rounded px-3 py-2 text-sm focus:border-spellbook-accent outline-none" placeholder="Brief description...">
+          </div>
+          <div>
+            <label class="block text-sm text-spellbook-muted mb-1">Priority</label>
+            <select id="quick-log-priority" class="bg-spellbook-card border border-spellbook-border rounded px-3 py-2 text-sm">
+              <option value="low">Low</option>
+              <option value="medium" selected>Medium</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm text-spellbook-muted mb-1">Description (optional)</label>
+            <textarea id="quick-log-description" class="w-full bg-spellbook-card border border-spellbook-border rounded px-3 py-2 text-sm h-24 resize-none focus:border-spellbook-accent outline-none" placeholder="Additional details..."></textarea>
+          </div>
+        </div>
+        <div class="mt-4 pt-4 border-t border-spellbook-border flex justify-end gap-2">
+          <button onclick="hideQuickLogModal()" class="px-4 py-2 text-spellbook-muted hover:text-white">
+            Cancel
+          </button>
+          <button onclick="submitQuickLog()" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold">
+            Create
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
