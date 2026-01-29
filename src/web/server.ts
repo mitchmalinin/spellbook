@@ -252,6 +252,101 @@ export function createServer(config: BoardConfig) {
     }
   });
 
+  // API: Create a worktree for an item
+  app.post('/api/worktree/create', async (req: Request, res: Response) => {
+    const { itemRef, branchName } = req.body;
+
+    if (!itemRef) {
+      res.status(400).json({ error: 'itemRef is required (e.g., bug-44, improvement-31)' });
+      return;
+    }
+
+    try {
+      // Parse the item reference
+      const match = itemRef.match(/^(bug|improvement|feature)-(\d+)$/);
+      if (!match) {
+        res.status(400).json({ error: 'Invalid itemRef format. Use: bug-44, improvement-31, or feature-5' });
+        return;
+      }
+
+      const [, type, numStr] = match;
+      const number = parseInt(numStr, 10);
+
+      // Determine worktree path
+      const worktreeBase = join(homedir(), 'tmp', 'worktrees', currentProject.id);
+      const worktreePath = join(worktreeBase, `${type}-${number}`);
+
+      // Determine branch name (use provided or generate default)
+      const finalBranchName = branchName || `${type === 'bug' ? 'fix' : type}/${number}`;
+
+      // Check if worktree already exists
+      if (existsSync(worktreePath)) {
+        res.status(409).json({
+          error: 'Worktree already exists',
+          path: worktreePath,
+          message: 'A worktree already exists at this path. Use the existing worktree or delete it first.',
+        });
+        return;
+      }
+
+      // Create worktree directory parent if needed
+      const parentDir = dirname(worktreePath);
+      if (!existsSync(parentDir)) {
+        mkdirSync(parentDir, { recursive: true });
+      }
+
+      // Create the worktree using git
+      try {
+        // Try creating with new branch
+        execSync(`git worktree add -b "${finalBranchName}" "${worktreePath}"`, {
+          cwd: currentProject.path,
+          stdio: 'pipe',
+        });
+      } catch (gitErr) {
+        // Try without creating new branch (branch might already exist)
+        try {
+          execSync(`git worktree add "${worktreePath}" "${finalBranchName}"`, {
+            cwd: currentProject.path,
+            stdio: 'pipe',
+          });
+        } catch (gitErr2) {
+          const errorMsg = gitErr2 instanceof Error ? gitErr2.message : String(gitErr2);
+          res.status(500).json({
+            error: 'Failed to create git worktree',
+            details: errorMsg,
+          });
+          return;
+        }
+      }
+
+      // Import createWorktree from db if not already done
+      // Register in database
+      const { createWorktree: dbCreateWorktree } = await import('../db/index.js');
+      dbCreateWorktree({
+        project_id: currentProject.id,
+        path: worktreePath,
+        branch: finalBranchName,
+        working_on: itemRef,
+        status: 'active',
+      });
+
+      console.log(`[Server] Created worktree for ${itemRef} at ${worktreePath}`);
+
+      res.status(201).json({
+        success: true,
+        path: worktreePath,
+        branch: finalBranchName,
+        workingOn: itemRef,
+      });
+    } catch (err) {
+      console.error('Failed to create worktree:', err);
+      res.status(500).json({
+        error: 'Failed to create worktree',
+        details: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
   // API: Get current git branch for a path
   app.get('/api/git/branch', (req: Request, res: Response) => {
     const targetPath = (req.query.path as string) || currentProject.path;

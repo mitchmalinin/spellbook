@@ -904,3 +904,32 @@
 .inbox-item {
   transition: all 0.15s ease;
 }
+
+/* ==================== WORK MODE MODAL ==================== */
+
+#work-mode-modal input[type="radio"] {
+  accent-color: #00ff88;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+#work-mode-modal label:has(input:checked) {
+  border-color: #00ff88;
+  background: rgba(0, 255, 136, 0.05);
+}
+
+#worktree-options {
+  animation: slideDown 0.2s ease;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
