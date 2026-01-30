@@ -2838,7 +2838,11 @@ export function createServer(config: BoardConfig) {
     }
 
     const dir = workingDir || currentProject.path;
-    const cmd = command || 'claude --dangerously-skip-permissions';
+    const baseCmd = command || 'claude --dangerously-skip-permissions';
+    // Prepend escape sequence to set iTerm tab title, then run command
+    // \x1b]0;TITLE\x07 sets both window and tab title
+    // \x1b]1;TITLE\x07 sets just tab title (icon name)
+    const cmd = `printf '\\e]1;${sessionName}\\a' && ${baseCmd}`;
 
     try {
       // If TTY is provided, try to focus by TTY first (more reliable)
