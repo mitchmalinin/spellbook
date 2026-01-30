@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Spellbook - Mission Control</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <!-- xterm.js for terminal emulation -->
@@ -36,64 +37,154 @@
   </script>
 </head>
 <body class="dark bg-spellbook-bg text-spellbook-text font-mono min-h-screen">
-  <div id="app" class="flex flex-col h-screen">
+  <div id="app" class="flex h-screen">
 
-    <!-- Header -->
-    <header class="border-b border-spellbook-border px-4 py-2 flex items-center justify-between">
-      <div class="flex items-center gap-4">
-        <h1 class="text-lg font-bold text-spellbook-accent">SPELLBOOK</h1>
-        <select id="project-selector" class="bg-spellbook-card border border-spellbook-border rounded px-3 py-1 text-sm">
-          <option value="">Loading...</option>
-        </select>
-        <span id="branch-display" class="text-xs text-spellbook-muted px-2 py-1 bg-spellbook-card rounded">
-          branch: loading...
-        </span>
-        <div class="relative">
-          <button onclick="toggleKnowledgeBase()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent flex items-center gap-2">
-            <span>📚</span> Knowledge Base <span id="kb-toggle" class="text-xs">▼</span>
-          </button>
-          <div id="knowledge-base" class="hidden absolute top-full left-0 mt-1 bg-spellbook-card border border-spellbook-border rounded-lg shadow-xl z-50 min-w-[250px] max-h-[400px] overflow-hidden">
-            <div class="p-2 border-b border-spellbook-border text-xs text-spellbook-muted">Project Documentation</div>
-            <div id="kb-list" class="max-h-[350px] overflow-y-auto"></div>
+    <!-- LEFT SIDEBAR (Icons Only) -->
+    <aside class="w-[60px] border-r border-spellbook-border flex flex-col items-center py-3 bg-spellbook-card shrink-0">
+      <!-- Navigation Icons -->
+      <nav class="flex flex-col gap-1 flex-1">
+        <button onclick="switchMainView('dashboard')" id="nav-dashboard" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg hover:bg-spellbook-accent/20 transition-colors" title="Dashboard">
+          <svg class="w-5 h-5 text-spellbook-muted group-hover:text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z"/>
+          </svg>
+          <span class="sidebar-tooltip">Dashboard</span>
+        </button>
+        <button onclick="switchMainView('kanban')" id="nav-kanban" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg bg-spellbook-accent/20 transition-colors" title="Kanban">
+          <svg class="w-5 h-5 text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/>
+          </svg>
+          <span class="sidebar-tooltip">Kanban</span>
+        </button>
+        <button onclick="switchMainView('inbox')" id="nav-inbox" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg hover:bg-spellbook-accent/20 transition-colors" title="Inbox">
+          <svg class="w-5 h-5 text-spellbook-muted group-hover:text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"/>
+          </svg>
+          <span id="nav-inbox-badge" class="absolute -top-1 -right-1 min-w-[18px] h-[18px] flex items-center justify-center bg-yellow-500 text-black text-[10px] font-bold rounded-full hidden">0</span>
+          <span class="sidebar-tooltip">Inbox</span>
+        </button>
+        <button onclick="switchMainView('investigate')" id="nav-investigate" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg hover:bg-spellbook-accent/20 transition-colors" title="Investigate">
+          <svg class="w-5 h-5 text-spellbook-muted group-hover:text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+          </svg>
+          <span class="sidebar-tooltip">Investigate</span>
+        </button>
+        <button onclick="switchMainView('terminals')" id="nav-terminals" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg hover:bg-spellbook-accent/20 transition-colors" title="Terminal Manager">
+          <svg class="w-5 h-5 text-spellbook-muted group-hover:text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+          </svg>
+          <span class="sidebar-tooltip">Terminals</span>
+        </button>
+        <button onclick="switchMainView('knowledge')" id="nav-knowledge" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg hover:bg-spellbook-accent/20 transition-colors" title="Knowledge Base">
+          <svg class="w-5 h-5 text-spellbook-muted group-hover:text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/>
+          </svg>
+          <span class="sidebar-tooltip">Knowledge Base</span>
+        </button>
+        <button onclick="switchMainView('worktrees')" id="nav-worktrees" class="sidebar-nav-btn group relative w-10 h-10 flex items-center justify-center rounded-lg hover:bg-spellbook-accent/20 transition-colors" title="Worktrees">
+          <svg class="w-5 h-5 text-spellbook-muted group-hover:text-spellbook-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 3v12"/>
+            <circle cx="6" cy="18" r="3" stroke-width="2"/>
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 6c6 0 6 6 12 6"/>
+            <circle cx="18" cy="12" r="3" stroke-width="2"/>
+          </svg>
+          <span class="sidebar-tooltip">Worktrees</span>
+        </button>
+      </nav>
+    </aside>
+
+    <!-- MAIN CONTENT WRAPPER -->
+    <div class="flex-1 flex flex-col overflow-hidden">
+
+      <!-- TOP HEADER (Simplified) -->
+      <header class="border-b border-spellbook-border px-4 py-2 flex items-center justify-between shrink-0">
+        <div class="flex items-center gap-4">
+          <div class="flex items-center gap-2">
+            <svg class="w-6 h-6" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+              <path d="M420 80 H 130 C 100 80 100 80 100 110 V 460 C 100 480 120 480 130 480 H 430 C 450 480 450 460 450 450 V 110 C 450 90 440 80 420 80 Z" fill="#F5E1C8" stroke="#333" stroke-width="5"/>
+              <path d="M430 450 H 130" stroke="#D4C0A8" stroke-width="4"/>
+              <path d="M430 460 H 130" stroke="#D4C0A8" stroke-width="4"/>
+              <rect x="80" y="50" width="340" height="400" rx="10" ry="10" fill="#4B0082" stroke="#2E0050" stroke-width="5"/>
+              <rect x="80" y="50" width="60" height="400" rx="10" ry="10" fill="#380061"/>
+              <path d="M420 50 L 370 50 L 420 100 Z" fill="#FFD700"/>
+              <path d="M420 450 L 370 450 L 420 400 Z" fill="#FFD700"/>
+              <circle cx="250" cy="250" r="70" fill="none" stroke="#FFD700" stroke-width="15"/>
+              <polygon points="250,195 265,240 310,240 275,265 285,310 250,285 215,310 225,265 190,240 235,240" fill="#FFD700"/>
+              <rect x="160" y="350" width="180" height="10" rx="5" fill="#FFD700" opacity="0.6"/>
+              <rect x="160" y="370" width="180" height="10" rx="5" fill="#FFD700" opacity="0.6"/>
+            </svg>
+            <h1 class="text-lg font-bold text-spellbook-accent">SPELLBOOK</h1>
           </div>
+          <select id="project-selector" class="bg-spellbook-card border border-spellbook-border rounded px-3 py-1 text-sm">
+            <option value="">Loading...</option>
+          </select>
         </div>
-        <!-- View Toggle -->
-        <div class="flex gap-1 ml-4">
-          <button onclick="switchMainView('dashboard')" id="view-dashboard-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
-            Dashboard
-          </button>
-          <button onclick="switchMainView('kanban')" id="view-kanban-btn" class="px-3 py-1 text-sm bg-spellbook-accent/20 text-spellbook-accent rounded">
-            Kanban
-          </button>
-          <button onclick="switchMainView('inbox')" id="view-inbox-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
-            Inbox <span id="inbox-badge" class="ml-1 px-1.5 py-0.5 bg-yellow-500/30 text-yellow-400 text-xs rounded-full">0</span>
-          </button>
-          <button onclick="switchMainView('investigate')" id="view-investigate-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
-            Investigate
-          </button>
-          <button onclick="switchMainView('terminals')" id="view-terminals-btn" class="px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
-            Terminal Manager
-          </button>
-        </div>
-      </div>
-      <div class="flex items-center gap-2">
-        <button onclick="quickLog('bug')" class="px-3 py-1 bg-red-500/20 text-red-400 rounded text-sm hover:bg-red-500/30">
-          + Bug
-        </button>
-        <button onclick="quickLog('improvement')" class="px-3 py-1 bg-blue-500/20 text-blue-400 rounded text-sm hover:bg-blue-500/30">
-          + Improvement
-        </button>
-        <button onclick="quickLog('feature')" class="px-3 py-1 bg-purple-500/20 text-purple-400 rounded text-sm hover:bg-purple-500/30">
-          + Feature
-        </button>
-        <button onclick="quickAddIdea()" class="px-3 py-1 bg-yellow-500/20 text-yellow-400 rounded text-sm hover:bg-yellow-500/30">
-          + Idea
-        </button>
-      </div>
-    </header>
+        <div class="flex items-center gap-3">
+          <!-- Branch Display -->
+          <span id="branch-display" class="text-xs text-spellbook-muted px-2 py-1 bg-spellbook-card rounded">
+            branch: loading...
+          </span>
 
-    <!-- Main Content Area -->
-    <main class="flex-1 flex flex-col overflow-hidden">
+          <!-- Uncommitted Changes Indicator -->
+          <div id="uncommitted-indicator" class="group relative flex items-center gap-1.5 px-2 py-1 bg-spellbook-card border border-spellbook-border rounded text-xs hidden">
+            <span id="uncommitted-dot" class="w-2 h-2 rounded-full bg-yellow-500"></span>
+            <span id="uncommitted-text" class="text-yellow-400">0 uncommitted</span>
+            <!-- Tooltip with file list -->
+            <div id="uncommitted-tooltip" class="absolute left-0 top-full mt-1 w-64 bg-spellbook-card border border-spellbook-border rounded shadow-lg p-2 hidden group-hover:block z-50 text-xs">
+              <div class="font-semibold text-spellbook-muted mb-1">Uncommitted Files:</div>
+              <div id="uncommitted-files" class="max-h-32 overflow-y-auto space-y-0.5 font-mono text-spellbook-text"></div>
+            </div>
+          </div>
+
+          <!-- Git Sync Status (vs origin/develop) -->
+          <div id="git-sync-indicator" class="flex items-center gap-1.5 px-2 py-1 bg-spellbook-card border border-spellbook-border rounded text-xs">
+            <span class="text-spellbook-muted">origin:</span>
+            <span id="git-sync-dot" class="w-2 h-2 rounded-full bg-gray-500" title="Checking..."></span>
+            <span id="git-sync-status" class="text-spellbook-muted">...</span>
+            <button id="git-sync-btn" onclick="pullFromOrigin()" class="px-2 py-0.5 bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30 hidden" title="Pull from origin/develop">
+              Pull
+            </button>
+          </div>
+
+          <!-- Main Comparison Indicator -->
+          <div id="main-comparison-indicator" class="group relative flex items-center gap-1.5 px-2 py-1 bg-spellbook-card border border-spellbook-border rounded text-xs">
+            <span class="text-spellbook-muted">main:</span>
+            <span id="main-comparison-dot" class="w-2 h-2 rounded-full bg-gray-500"></span>
+            <span id="main-comparison-text" class="text-spellbook-muted">...</span>
+            <!-- Tooltip with explanation -->
+            <div class="absolute left-0 top-full mt-1 w-56 bg-spellbook-card border border-spellbook-border rounded shadow-lg p-2 hidden group-hover:block z-50 text-xs">
+              <div id="main-comparison-tooltip" class="text-spellbook-text">Comparing develop to origin/main</div>
+            </div>
+          </div>
+
+          <!-- Pull Main Button -->
+          <button id="pull-main-btn" onclick="pullMainIntoDevelop()" class="flex items-center gap-1 px-2 py-1 bg-purple-500/20 text-purple-400 border border-purple-500/30 rounded text-xs hover:bg-purple-500/30 transition-colors" title="Pull origin/main into develop">
+            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+            </svg>
+            <span id="pull-main-text">Pull Main</span>
+          </button>
+
+          <!-- Last Sync Time -->
+          <span id="git-sync-time" class="text-spellbook-muted/50 text-[10px]" title="Last checked"></span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="quickLog('bug')" class="px-3 py-1 bg-red-500/20 text-red-400 rounded text-sm hover:bg-red-500/30">
+            + Bug
+          </button>
+          <button onclick="quickLog('improvement')" class="px-3 py-1 bg-blue-500/20 text-blue-400 rounded text-sm hover:bg-blue-500/30">
+            + Improvement
+          </button>
+          <button onclick="quickLog('feature')" class="px-3 py-1 bg-purple-500/20 text-purple-400 rounded text-sm hover:bg-purple-500/30">
+            + Feature
+          </button>
+          <button onclick="quickAddIdea()" class="px-3 py-1 bg-yellow-500/20 text-yellow-400 rounded text-sm hover:bg-yellow-500/30">
+            + Idea
+          </button>
+        </div>
+      </header>
+
+      <!-- Main Content Area -->
+      <main class="flex-1 flex flex-col overflow-hidden">
 
       <!-- DASHBOARD VIEW -->
       <div id="dashboard-view" class="flex-1 flex-col overflow-hidden hidden">
@@ -290,9 +381,9 @@
       </div>
 
       <!-- KANBAN VIEW (Default) -->
-      <div id="kanban-view" class="flex-1 flex overflow-hidden">
+      <div id="kanban-view" class="flex-1">
         <!-- LEFT: Kanban Board (2/3) -->
-        <div id="kanban-panel" class="w-2/3 border-r border-spellbook-border flex flex-col">
+        <div id="kanban-panel" class="border-r border-spellbook-border flex flex-col">
           <!-- Kanban Header -->
           <div class="px-4 py-2 border-b border-spellbook-border flex items-center justify-between">
             <div class="flex items-center gap-4">
@@ -318,8 +409,22 @@
                 <option value="oldest">Oldest First</option>
                 <option value="number">By Number</option>
               </select>
+              <!-- Search -->
+              <div class="flex items-center gap-1">
+                <input type="text"
+                       id="kanban-search"
+                       placeholder="Search bugs, improvements..."
+                       class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-xs focus:border-spellbook-accent focus:outline-none w-48"
+                       oninput="handleKanbanSearch(this.value)">
+                <button onclick="clearKanbanSearch()" class="text-spellbook-muted hover:text-white text-sm px-1" title="Clear search">×</button>
+              </div>
             </div>
-            <span id="kanban-count" class="text-xs text-spellbook-muted"></span>
+            <div class="flex items-center gap-2">
+              <span id="kanban-count" class="text-xs text-spellbook-muted"></span>
+              <button onclick="refreshKanban()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent" title="Refresh board">
+                ↻ Refresh
+              </button>
+            </div>
           </div>
 
           <!-- Kanban Columns -->
@@ -364,10 +469,9 @@
         </div>
 
         <!-- RIGHT: Quick Chat + Recent Activity (1/3) -->
-        <div id="quick-chat-panel" class="w-1/3 flex flex-col">
-          <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
+        <div id="quick-chat-panel" class="flex flex-col">
+          <div class="px-3 py-2 border-b border-spellbook-border">
             <span class="text-sm font-semibold">Quick Chat</span>
-            <span class="text-xs text-spellbook-muted">For rapid logging</span>
           </div>
           <div id="quick-chat-terminal" class="flex-1 bg-[#0a0a0f]"></div>
 
@@ -386,18 +490,20 @@
 
       <!-- TERMINAL MANAGER VIEW (Hidden by default) -->
       <div id="terminal-manager-view" class="flex-1 flex-col overflow-hidden hidden">
-        <!-- Active Sessions Grid -->
+        <!-- iTerm Sessions -->
         <div class="p-4 border-b border-spellbook-border">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm font-semibold">Active Sessions</span>
-            <button onclick="closeAllIdleSessions()" class="text-xs text-spellbook-muted hover:text-red-400">
-              Close All Idle
-            </button>
+            <span class="text-sm font-semibold">Active iTerm Sessions</span>
+            <div class="flex items-center gap-2">
+              <button onclick="refreshItermSessions()" class="text-xs text-spellbook-muted hover:text-spellbook-accent">
+                ↻ Refresh
+              </button>
+            </div>
           </div>
-          <div id="sessions-grid" class="grid grid-cols-3 gap-3">
+          <div id="sessions-grid" class="grid grid-cols-4 gap-3">
             <!-- Session cards rendered here -->
-            <div class="text-center text-spellbook-muted py-8 col-span-3">
-              No active sessions. Click an item on the Kanban board to start planning.
+            <div class="text-center text-spellbook-muted py-8 col-span-4">
+              No active iTerm sessions detected. Click "Work on this" on an item to start.
             </div>
           </div>
         </div>
@@ -419,35 +525,184 @@
         </div>
       </div>
 
+      <!-- KNOWLEDGE BASE VIEW -->
+      <div id="knowledge-view" class="flex-1 flex-col overflow-hidden hidden">
+        <!-- Knowledge Base Header -->
+        <div class="px-6 py-4 border-b border-spellbook-border">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-xl font-bold text-spellbook-accent">Knowledge Base</h2>
+              <div id="kb-root-path" class="text-sm text-spellbook-muted mt-1">~/.spellbook/projects/{project}/knowledge</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="createKBDoc()" class="px-3 py-1 bg-spellbook-accent/20 text-spellbook-accent rounded text-sm hover:bg-spellbook-accent/30">
+                + New Doc
+              </button>
+              <button onclick="refreshKnowledgeBase()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent">
+                Refresh
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-1 flex overflow-hidden">
+          <!-- Left: File Tree (30%) -->
+          <div class="w-[30%] border-r border-spellbook-border flex flex-col overflow-hidden shrink-0">
+            <!-- Search -->
+            <div class="p-3 border-b border-spellbook-border">
+              <input type="text" id="kb-search" onkeyup="filterKBTree()" class="w-full bg-spellbook-card border border-spellbook-border rounded px-3 py-2 text-sm focus:border-spellbook-accent outline-none" placeholder="Search files...">
+            </div>
+
+            <!-- File Tree -->
+            <div id="kb-file-tree" class="flex-1 overflow-y-auto p-2">
+              <div class="text-center text-spellbook-muted py-8 text-sm">
+                Loading file tree...
+              </div>
+            </div>
+
+            <!-- Stats Footer -->
+            <div class="p-3 border-t border-spellbook-border bg-spellbook-card/50">
+              <div class="flex justify-between text-xs">
+                <span class="text-spellbook-muted">Docs: <span id="kb-stat-total" class="text-spellbook-text">0</span></span>
+                <span class="text-spellbook-muted">Folders: <span id="kb-stat-categories" class="text-spellbook-text">0</span></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Document Viewer/Editor (70%) -->
+          <div class="flex-1 flex flex-col overflow-hidden">
+            <!-- Document Header -->
+            <div class="px-4 py-3 border-b border-spellbook-border flex items-center justify-between">
+              <div class="flex items-center gap-3 min-w-0">
+                <span id="kb-doc-title" class="text-sm font-semibold text-spellbook-muted truncate">Select a document</span>
+                <span id="kb-doc-path" class="text-xs text-spellbook-muted/70 font-mono truncate hidden"></span>
+              </div>
+              <div id="kb-doc-actions" class="flex items-center gap-2 hidden">
+                <button onclick="toggleKBEditMode()" id="kb-edit-toggle" class="px-3 py-1 text-xs bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent">
+                  Edit
+                </button>
+                <button onclick="saveKBDoc()" id="kb-save-btn" class="hidden px-3 py-1 text-xs bg-spellbook-accent text-spellbook-bg rounded hover:bg-spellbook-accent/80">
+                  Save
+                </button>
+                <button onclick="openKBInClaude()" id="kb-claude-btn" class="px-3 py-1 text-xs bg-purple-500/20 text-purple-400 rounded hover:bg-purple-500/30" title="Open Claude session in knowledge directory">
+                  Claude
+                </button>
+              </div>
+            </div>
+
+            <!-- Document Content (View Mode) -->
+            <div id="kb-doc-view" class="flex-1 overflow-auto p-6 prose prose-invert max-w-none">
+              <div class="text-center text-spellbook-muted py-16">
+                <div class="text-4xl mb-4">📚</div>
+                <div class="text-lg mb-2">Knowledge Base</div>
+                <div class="text-sm">Select a document from the file tree to view its contents</div>
+              </div>
+            </div>
+
+            <!-- Document Editor (Edit Mode - hidden by default) -->
+            <div id="kb-doc-edit" class="flex-1 flex-col overflow-hidden hidden">
+              <textarea id="kb-editor" class="flex-1 w-full bg-spellbook-bg border-0 p-6 text-sm font-mono text-spellbook-text resize-none focus:outline-none" placeholder="Enter markdown content..."></textarea>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- WORKTREES VIEW -->
+      <div id="worktrees-view" class="flex-1 flex overflow-hidden hidden">
+        <!-- Left: Worktrees List (60%) -->
+        <div class="w-[60%] flex flex-col border-r border-spellbook-border">
+          <!-- Worktrees Header -->
+          <div class="px-6 py-4 border-b border-spellbook-border">
+            <div class="flex items-center justify-between">
+              <div>
+                <h2 class="text-xl font-bold text-spellbook-accent">Worktrees</h2>
+                <div id="worktrees-project-path" class="text-sm text-spellbook-muted mt-1">Parallel development branches</div>
+              </div>
+              <div class="flex items-center gap-2">
+                <button onclick="refreshWorktreesView()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent">
+                  Refresh
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Worktrees Content -->
+          <div class="flex-1 overflow-auto p-6">
+            <!-- Stats Row -->
+            <div class="grid grid-cols-4 gap-4 mb-6">
+              <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-4">
+                <div id="wt-stat-total" class="text-2xl font-bold text-spellbook-accent">0</div>
+                <div class="text-xs text-spellbook-muted">Total Worktrees</div>
+              </div>
+              <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-4">
+                <div id="wt-stat-active" class="text-2xl font-bold text-green-400">0</div>
+                <div class="text-xs text-spellbook-muted">Active</div>
+              </div>
+              <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-4">
+                <div id="wt-stat-assigned" class="text-2xl font-bold text-blue-400">0</div>
+                <div class="text-xs text-spellbook-muted">Assigned to Items</div>
+              </div>
+              <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-4">
+                <div id="wt-stat-main" class="text-2xl font-bold text-purple-400">1</div>
+                <div class="text-xs text-spellbook-muted">Main Repo</div>
+              </div>
+            </div>
+
+            <!-- Worktrees List -->
+            <div class="mb-4 flex items-center justify-between">
+              <h3 class="text-sm font-semibold text-spellbook-muted">ACTIVE WORKTREES</h3>
+              <span id="worktrees-count" class="text-xs text-spellbook-muted">0 worktrees</span>
+            </div>
+            <div id="worktrees-list" class="space-y-3">
+              <div class="text-center text-spellbook-muted py-8">Loading worktrees...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: Worktree Terminal (40%) -->
+        <div class="w-[40%] flex flex-col">
+          <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
+            <span class="text-sm font-semibold">Worktree Terminal</span>
+            <span id="worktree-terminal-status" class="text-xs text-gray-400">Not connected</span>
+          </div>
+          <div id="worktree-terminal" class="flex-1 min-h-0 bg-[#0a0a0f]"></div>
+        </div>
+      </div>
+
     </main>
 
-    <!-- Session Status Bar -->
-    <div id="session-status-bar" class="border-t border-spellbook-border px-4 py-1 flex items-center gap-2 overflow-x-auto">
-      <span class="text-xs text-spellbook-muted mr-2">SESSIONS:</span>
-      <div id="session-pills" class="flex gap-2">
-        <!-- Session pills rendered here -->
+    </div> <!-- End of MAIN CONTENT WRAPPER -->
+
+  </div> <!-- End of #app -->
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="fixed top-4 right-4 z-[100] flex flex-col gap-2 max-w-md"></div>
+
+  <!-- UNIFIED BOTTOM BAR - Single bar with sessions, stats, and worktrees -->
+  <footer id="bottom-bar" class="fixed bottom-0 left-0 right-0 border-t border-spellbook-border pl-[72px] pr-3 py-1.5 flex items-center gap-4 text-xs bg-spellbook-card z-40">
+    <!-- Sessions -->
+    <div class="flex items-center gap-2">
+      <span class="text-spellbook-muted">SESSIONS:</span>
+      <div id="session-pills" class="flex gap-1">
+        <span class="text-spellbook-muted">No active sessions</span>
       </div>
-      <div class="flex-1"></div>
-      <span id="stats-summary" class="text-xs text-spellbook-muted"></span>
     </div>
 
-    <!-- Activity Bar (Bottom) -->
-    <footer class="border-t border-spellbook-border px-4 py-1 flex items-center justify-between text-xs">
-      <div id="activity-feed" class="flex-1 text-spellbook-muted truncate">
-        Ready
-      </div>
-      <div class="flex items-center gap-4">
-        <button onclick="toggleWorktrees()" class="text-spellbook-muted hover:text-white flex items-center gap-1">
-          WORKTREES <span id="worktree-toggle">▼</span>
-        </button>
-      </div>
-    </footer>
+    <div class="flex-1"></div>
 
-    <!-- Worktrees Dropdown -->
-    <div id="worktree-dropdown" class="hidden absolute bottom-12 right-4 bg-spellbook-card border border-spellbook-border rounded-lg shadow-xl p-3 min-w-[300px] max-h-[200px] overflow-auto z-50">
-      <div class="text-xs font-semibold text-spellbook-muted mb-2">Active Worktrees</div>
-      <div id="worktree-list" class="space-y-1"></div>
-    </div>
+    <!-- Stats -->
+    <span id="stats-summary" class="text-spellbook-muted"></span>
+
+    <!-- Worktrees -->
+    <button onclick="toggleWorktrees()" class="text-spellbook-muted hover:text-spellbook-accent flex items-center gap-1">
+      WORKTREES <span id="worktree-toggle">▼</span>
+    </button>
+  </footer>
+
+  <!-- Worktrees Dropdown - Fixed position above bottom bar -->
+  <div id="worktree-dropdown" class="hidden fixed bottom-10 right-4 bg-spellbook-card border border-spellbook-border rounded-lg shadow-xl p-3 min-w-[300px] max-h-[200px] overflow-auto z-50">
+    <div class="text-xs font-semibold text-spellbook-muted mb-2">Active Worktrees</div>
+    <div id="worktree-list" class="space-y-1"></div>
   </div>
 
   <!-- PLANNING VIEW OVERLAY (Fullscreen when open) -->
@@ -477,11 +732,11 @@
       </div>
     </div>
 
-    <!-- Planning View Content -->
-    <div class="flex-1 flex overflow-hidden">
-      <!-- LEFT: Document Viewer -->
-      <div class="w-1/2 border-r border-spellbook-border flex flex-col">
-        <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
+    <!-- Planning View Content - Full Width Documentation -->
+    <div class="flex-1 flex overflow-hidden" id="planning-split-container">
+      <!-- Document Viewer (Full Width - No Terminal) -->
+      <div class="flex-1 flex flex-col" id="planning-doc-panel">
+        <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between shrink-0">
           <div class="flex gap-2">
             <button onclick="setPlanningDocTab('document')" class="planning-doc-tab active px-3 py-1 text-sm rounded" data-tab="document">Document</button>
             <button onclick="setPlanningDocTab('plan')" class="planning-doc-tab px-3 py-1 text-sm rounded" data-tab="plan">Plan</button>
@@ -490,33 +745,19 @@
               Files <span id="files-count" class="text-xs text-spellbook-muted ml-1"></span>
             </button>
           </div>
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-3">
             <span id="plan-status-indicator" class="text-xs"></span>
             <span id="doc-refresh-indicator" class="text-xs text-spellbook-muted">↻ Auto-refreshes</span>
             <span id="doc-last-modified" class="text-xs text-spellbook-muted"></span>
+            <!-- Open in iTerm Button -->
+            <button id="open-iterm-btn" onclick="openInIterm()" class="px-3 py-1 text-sm bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30 flex items-center gap-2">
+              <span>⌘</span> Open in iTerm
+            </button>
           </div>
         </div>
-        <div id="planning-document-content" class="flex-1 overflow-auto p-4 prose prose-invert max-w-none">
+        <div id="planning-document-content" class="flex-1 overflow-auto p-4 prose prose-invert max-w-none min-h-0">
           Loading document...
         </div>
-      </div>
-
-      <!-- RIGHT: Terminal -->
-      <div class="w-1/2 flex flex-col">
-        <div class="px-3 py-2 border-b border-spellbook-border flex items-center justify-between">
-          <div class="flex items-center gap-3">
-            <span class="text-sm font-semibold">Terminal</span>
-            <span id="terminal-branch" class="text-xs px-2 py-0.5 bg-purple-500/20 text-purple-400 rounded font-mono">branch: loading...</span>
-          </div>
-          <div class="flex items-center gap-2">
-            <span class="text-xs text-spellbook-muted">type /exit to return to bash</span>
-            <button onclick="exitClaudeTerminal()" class="px-2 py-1 text-xs bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
-              Exit Claude
-            </button>
-            <span id="terminal-status" class="text-xs text-green-400">● Connected</span>
-          </div>
-        </div>
-        <div id="planning-terminal" class="flex-1 bg-[#0a0a0f]"></div>
       </div>
     </div>
 
@@ -524,6 +765,7 @@
     <div class="border-t border-spellbook-border px-4 py-2 flex items-center justify-between">
       <div class="flex items-center gap-4">
         <span class="text-xs text-spellbook-muted">Working on: <span id="planning-working-ref" class="text-spellbook-accent">improvement-32</span></span>
+        <span id="workflow-phase-badge" class="px-2 py-0.5 text-xs rounded bg-blue-500/20 text-blue-400">planning</span>
         <!-- Workflow Progress Indicator -->
         <div id="workflow-progress" class="flex items-center gap-1 text-xs">
           <span id="wf-step-plan" class="workflow-step px-2 py-0.5 rounded bg-gray-500/20 text-gray-400">Plan</span>
@@ -538,13 +780,7 @@
         </div>
       </div>
       <div class="flex items-center gap-2">
-        <button onclick="finalizePlanning()" id="finalize-btn" class="px-4 py-2 bg-blue-500/20 text-blue-400 rounded hover:bg-blue-500/30">
-          Finalize Planning ✓
-        </button>
-        <button id="start-impl-btn" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hover:bg-spellbook-accent/80">
-          Start Implementation →
-        </button>
-        <!-- Additional workflow buttons (hidden by default) -->
+        <!-- Workflow buttons - shown contextually based on status -->
         <button id="create-pr-btn" onclick="createPullRequest()" class="hidden px-4 py-2 bg-purple-500 text-white rounded font-semibold hover:bg-purple-600">
           Create PR →
         </button>
@@ -553,6 +789,10 @@
         </button>
         <button id="finalize-item-btn" onclick="finalizeItem()" class="hidden px-4 py-2 bg-green-500 text-white rounded font-semibold hover:bg-green-600">
           Mark Complete ✓
+        </button>
+        <!-- Subtle fallback if Claude doesn't auto-implement -->
+        <button id="manual-implement-btn" onclick="triggerImplementSkill()" class="hidden px-3 py-1 text-xs text-spellbook-muted hover:text-spellbook-accent border border-spellbook-border rounded" title="Use if Claude didn't auto-start after plan approval">
+          ↻ Retry /implement
         </button>
       </div>
     </div>
@@ -693,6 +933,15 @@
             <div class="text-xs text-spellbook-muted">
               Worktree will be created at: <span id="worktree-path-preview" class="font-mono text-spellbook-text">~/.worktrees/project/branch</span>
             </div>
+            <div class="flex flex-col gap-2 mt-3">
+              <label class="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" id="worktree-install-deps" class="rounded border-spellbook-border" checked>
+                <span>Install dependencies</span>
+              </label>
+            </div>
+            <div class="text-xs text-spellbook-muted mt-2 p-2 bg-spellbook-card/50 rounded">
+              <strong>Full setup:</strong> Creates worktree, copies .env files, symlinks docs/knowledge, allocates ports, installs deps, and launches Claude agent.
+            </div>
           </div>
         </div>
 
@@ -702,6 +951,145 @@
           </button>
           <button onclick="submitWorkMode()" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hover:bg-spellbook-accent/80">
             Start Working
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Worktree Progress Modal -->
+  <div id="worktree-progress-modal" class="modal-overlay hidden">
+    <div class="modal-content max-w-md">
+      <div class="modal-header">
+        <div>
+          <h3 class="font-bold text-lg">Creating Worktree</h3>
+          <div id="progress-item-ref" class="text-sm text-spellbook-accent font-mono mt-1">bug-44</div>
+        </div>
+      </div>
+      <div class="modal-body">
+        <!-- Progress Steps -->
+        <div id="progress-steps" class="space-y-3">
+          <div class="progress-step" data-step="create">
+            <div class="flex items-center gap-3">
+              <div class="progress-icon w-6 h-6 rounded-full bg-spellbook-card border border-spellbook-border flex items-center justify-center text-xs">
+                <span class="step-pending">○</span>
+                <span class="step-active hidden">
+                  <svg class="animate-spin h-4 w-4 text-spellbook-accent" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                </span>
+                <span class="step-done hidden text-green-400">✓</span>
+                <span class="step-error hidden text-red-400">✗</span>
+              </div>
+              <div class="flex-1">
+                <div class="text-sm font-medium">Creating worktree</div>
+                <div class="text-xs text-spellbook-muted step-status">Waiting...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="progress-step" data-step="checkout">
+            <div class="flex items-center gap-3">
+              <div class="progress-icon w-6 h-6 rounded-full bg-spellbook-card border border-spellbook-border flex items-center justify-center text-xs">
+                <span class="step-pending">○</span>
+                <span class="step-active hidden">
+                  <svg class="animate-spin h-4 w-4 text-spellbook-accent" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                </span>
+                <span class="step-done hidden text-green-400">✓</span>
+                <span class="step-error hidden text-red-400">✗</span>
+              </div>
+              <div class="flex-1">
+                <div class="text-sm font-medium">Checking out branch</div>
+                <div class="text-xs text-spellbook-muted step-status">Waiting...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="progress-step" data-step="setup">
+            <div class="flex items-center gap-3">
+              <div class="progress-icon w-6 h-6 rounded-full bg-spellbook-card border border-spellbook-border flex items-center justify-center text-xs">
+                <span class="step-pending">○</span>
+                <span class="step-active hidden">
+                  <svg class="animate-spin h-4 w-4 text-spellbook-accent" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                </span>
+                <span class="step-done hidden text-green-400">✓</span>
+                <span class="step-error hidden text-red-400">✗</span>
+              </div>
+              <div class="flex-1">
+                <div class="text-sm font-medium">Setting up environment</div>
+                <div class="text-xs text-spellbook-muted step-status">Waiting...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="progress-step" data-step="deps">
+            <div class="flex items-center gap-3">
+              <div class="progress-icon w-6 h-6 rounded-full bg-spellbook-card border border-spellbook-border flex items-center justify-center text-xs">
+                <span class="step-pending">○</span>
+                <span class="step-active hidden">
+                  <svg class="animate-spin h-4 w-4 text-spellbook-accent" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                </span>
+                <span class="step-done hidden text-green-400">✓</span>
+                <span class="step-error hidden text-red-400">✗</span>
+              </div>
+              <div class="flex-1">
+                <div class="text-sm font-medium">Installing dependencies</div>
+                <div class="text-xs text-spellbook-muted step-status">Waiting...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="progress-step" data-step="ready">
+            <div class="flex items-center gap-3">
+              <div class="progress-icon w-6 h-6 rounded-full bg-spellbook-card border border-spellbook-border flex items-center justify-center text-xs">
+                <span class="step-pending">○</span>
+                <span class="step-active hidden">
+                  <svg class="animate-spin h-4 w-4 text-spellbook-accent" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                </span>
+                <span class="step-done hidden text-green-400">✓</span>
+                <span class="step-error hidden text-red-400">✗</span>
+              </div>
+              <div class="flex-1">
+                <div class="text-sm font-medium">Ready to work</div>
+                <div class="text-xs text-spellbook-muted step-status">Waiting...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Result Summary (shown after completion) -->
+        <div id="progress-result" class="hidden mt-4 p-3 rounded-lg">
+          <div id="progress-result-content"></div>
+        </div>
+
+        <!-- Error Message -->
+        <div id="progress-error" class="hidden mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+          <div class="text-sm text-red-400" id="progress-error-message"></div>
+        </div>
+
+        <!-- Actions -->
+        <div class="mt-6 pt-4 border-t border-spellbook-border flex justify-end gap-2">
+          <button id="progress-cancel-btn" onclick="cancelWorktreeProgress()" class="px-4 py-2 text-spellbook-muted hover:text-white">
+            Cancel
+          </button>
+          <button id="progress-continue-btn" onclick="continueFromProgress()" class="px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hidden">
+            Open Planning View
+          </button>
+          <button id="progress-retry-btn" onclick="retryWorktreeCreation()" class="px-4 py-2 bg-red-500/20 text-red-400 rounded font-semibold hidden">
+            Retry
           </button>
         </div>
       </div>

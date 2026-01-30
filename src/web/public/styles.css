@@ -4,6 +4,246 @@
   box-sizing: border-box;
 }
 
+/* ==================== CRITICAL LAYOUT FIXES ==================== */
+
+/* Ensure the app container and main content have proper height chain */
+#app {
+  height: calc(100vh - 32px);  /* Account for single fixed bottom bar */
+  display: flex;
+}
+
+#app > .flex-1 {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  /* Ensure main content wrapper takes full remaining width */
+  flex: 1 1 0%;
+  min-width: 0;
+  width: 0;  /* Combined with flex: 1, this ensures full stretch */
+}
+
+#app main {
+  flex: 1 1 0%;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;  /* Ensure main takes full width of parent */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/*
+ * View visibility rules - hidden class takes absolute precedence
+ */
+#kanban-view.hidden,
+#inbox-view.hidden,
+#dashboard-view.hidden,
+#investigate-view.hidden,
+#terminal-manager-view.hidden,
+#knowledge-view.hidden {
+  display: none !important;
+}
+
+/* When kanban-view is visible, use grid layout with EXPLICIT dimensions */
+#kanban-view:not(.hidden) {
+  display: grid !important;
+  grid-template-columns: 2fr 1fr !important;
+  grid-template-rows: 1fr !important;  /* Single row fills available space */
+  height: 100% !important;
+  width: 100% !important;
+  overflow: hidden !important;
+  gap: 0 !important;
+}
+
+/* Ensure grid children are positioned in their cells */
+#kanban-view > #kanban-panel {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+#kanban-view > #quick-chat-panel {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+/* Other views use flex layout when visible */
+#dashboard-view:not(.hidden),
+#inbox-view:not(.hidden),
+#investigate-view:not(.hidden),
+#terminal-manager-view:not(.hidden),
+#knowledge-view:not(.hidden) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+}
+
+/* Kanban panel - LEFT side (2/3 width) */
+#kanban-panel {
+  height: 100%;
+  min-height: 0;  /* Critical: allows flex children to shrink */
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Quick chat panel - RIGHT side (1/3 width) */
+#quick-chat-panel {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  margin: 0;
+  padding: 0;
+}
+
+/* Terminal wrapper - needs relative positioning for absolute child */
+#quick-chat-terminal {
+  flex: 1 1 0%;
+  min-height: 0;
+  position: relative;  /* Critical: positioning context for absolute xterm */
+  overflow: hidden;
+}
+
+/* Force xterm to fill container using absolute positioning */
+#quick-chat-terminal .xterm {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+#quick-chat-terminal .xterm-viewport {
+  width: 100% !important;
+  height: 100% !important;
+  overflow-y: auto !important;
+  overscroll-behavior: contain;
+}
+
+#quick-chat-terminal .xterm-screen {
+  width: 100% !important;
+}
+
+#quick-chat-terminal .xterm-helper-textarea {
+  position: absolute !important;
+  opacity: 0 !important;
+}
+
+/* Investigation terminal */
+#investigation-terminal {
+  flex: 1 1 0%;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+#investigation-terminal .xterm {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+#investigation-terminal .xterm-viewport {
+  width: 100% !important;
+  height: 100% !important;
+  overflow-y: auto !important;
+  overscroll-behavior: contain;
+}
+
+#investigation-terminal .xterm-screen {
+  width: 100% !important;
+}
+
+/* ==================== TERMINAL DRAG AND DROP ==================== */
+
+/* Drag over state for terminal containers */
+#quick-chat-terminal.drag-over,
+#investigation-terminal.drag-over {
+  position: relative;
+}
+
+#quick-chat-terminal.drag-over::after,
+#investigation-terminal.drag-over::after {
+  content: 'Drop image or file here';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 255, 136, 0.1);
+  border: 2px dashed #00ff88;
+  border-radius: 8px;
+  color: #00ff88;
+  font-size: 16px;
+  font-weight: 600;
+  z-index: 100;
+  pointer-events: none;
+}
+
+/* Upload progress indicator */
+.terminal-upload-indicator {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  background: rgba(0, 0, 0, 0.8);
+  border: 1px solid #00ff88;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #00ff88;
+  font-size: 12px;
+  z-index: 101;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminal-upload-indicator .spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid transparent;
+  border-top-color: #00ff88;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Success flash */
+.terminal-upload-success {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  background: rgba(0, 255, 136, 0.2);
+  border: 1px solid #00ff88;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #00ff88;
+  font-size: 12px;
+  z-index: 101;
+  animation: fadeOut 2s forwards;
+}
+
+@keyframes fadeOut {
+  0% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 /* ==================== KANBAN FILTER BUTTONS ==================== */
 
 .kanban-filter {
@@ -46,6 +286,7 @@
 
 #terminal-view .xterm-viewport {
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 /* Make xterm fill the container */
@@ -932,4 +1173,220 @@
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* ==================== SIDEBAR NAVIGATION ==================== */
+
+.sidebar-nav-btn {
+  position: relative;
+}
+
+.sidebar-nav-btn.active {
+  background: rgba(0, 255, 136, 0.2);
+}
+
+.sidebar-nav-btn.active svg {
+  color: #00ff88;
+}
+
+.sidebar-tooltip {
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-left: 8px;
+  padding: 6px 10px;
+  background: #14141f;
+  border: 1px solid #1f1f2e;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #e0e0e0;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.sidebar-nav-btn:hover .sidebar-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* ==================== KNOWLEDGE BASE VIEW ==================== */
+
+.kb-category-btn {
+  color: #666680;
+  transition: all 0.15s ease;
+}
+
+.kb-category-btn:hover {
+  color: #e0e0e0;
+}
+
+.kb-category-btn.active {
+  background: rgba(0, 255, 136, 0.1);
+  color: #00ff88;
+}
+
+.kb-doc-item {
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.kb-doc-item:hover {
+  background: rgba(0, 255, 136, 0.05);
+}
+
+.kb-doc-item.active {
+  background: rgba(0, 255, 136, 0.1);
+  border-left: 3px solid #00ff88;
+}
+
+/* ==================== TOAST NOTIFICATIONS ==================== */
+
+#toast-container {
+  pointer-events: none;
+}
+
+#toast-container > * {
+  pointer-events: auto;
+}
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slideOutRight {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+}
+
+.animate-slide-in {
+  animation: slideInRight 0.3s ease forwards;
+}
+
+.animate-slide-out {
+  animation: slideOutRight 0.3s ease forwards;
+}
+
+/* ==================== PLANNING VIEW LAYOUT ==================== */
+
+/* Ensure planning view takes full space */
+#planning-view {
+  display: flex;
+  flex-direction: column;
+}
+
+#planning-view.hidden {
+  display: none !important;
+}
+
+/* Planning content container - full width for document viewer */
+#planning-split-container {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: flex;
+  width: 100%;
+}
+
+/* Document panel - takes full width (terminal removed) */
+#planning-doc-panel {
+  flex: 1 1 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Ensure document content scrolls properly */
+#planning-document-content {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ==================== GIT STATUS INDICATORS ==================== */
+
+#uncommitted-indicator:hover #uncommitted-tooltip {
+  display: block;
+}
+
+/* Pulsing animation for urgent Pull Main button */
+@keyframes urgentPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(239, 68, 68, 0);
+  }
+}
+
+#pull-main-btn.animate-pulse {
+  animation: urgentPulse 2s ease-in-out infinite;
+}
+
+/* ==================== MINI TERMINAL PREVIEW ==================== */
+
+.terminal-preview {
+  background: #0a0a0f;
+  border: 1px solid #1f1f2e;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.terminal-preview-content {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 10px;
+  margin: 0;
+  height: 150px;
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+  background: transparent;
+}
+
+.session-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 280px;
+}
+
+.session-card .terminal-preview {
+  flex: 1;
+  min-height: 150px;
+  max-height: 200px;
+}
+
+/* Hover effect for preview - subtle glow */
+.session-card:hover .terminal-preview {
+  border-color: #00ff88;
+  box-shadow: 0 0 8px rgba(0, 255, 136, 0.1);
+}
+
+/* Text colors for preview content */
+.terminal-preview-content.text-spellbook-text {
+  color: #c0c0c0;
+}
+
+.terminal-preview-content.text-spellbook-muted {
+  color: #666680;
+  font-style: italic;
 }

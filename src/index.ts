@@ -12,6 +12,7 @@ import { docCommand } from './commands/doc.js';
 import { activityCommand } from './commands/activity.js';
 import { rebuildCommand } from './commands/rebuild.js';
 import { finalizeCommand } from './commands/finalize.js';
+import { prCommand } from './commands/pr.js';
 import { ideaCommand, inboxCommand } from './commands/idea.js';
 import { specCommand, readyCommand, startCommand } from './commands/spec.js';
 import { roadmapCommand } from './commands/roadmap.js';
@@ -30,6 +31,7 @@ program.addCommand(initCommand);
 program.addCommand(logCommand);
 program.addCommand(updateCommand);
 program.addCommand(finalizeCommand);
+program.addCommand(prCommand);        // Mark item as having open PR
 program.addCommand(statusCommand);
 program.addCommand(generateCommand);
 program.addCommand(syncCommand);

@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS features (
 
 -- ═══════════════════════════════════════════════════════════════
 -- IMPROVEMENTS: Tech debt, refactors per project
--- Lifecycle: spec_draft → spec_ready → active → in_progress → completed
+-- Lifecycle: spec_draft → spec_ready → active → in_progress → pr_open → completed
 -- ═══════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS improvements (
     id INTEGER PRIMARY KEY,
@@ -45,11 +45,13 @@ CREATE TABLE IF NOT EXISTS improvements (
     title TEXT NOT NULL,
     priority TEXT DEFAULT 'medium',
     linked_feature INTEGER,           -- Feature number (not ID, no FK constraint)
-    status TEXT DEFAULT 'spec_draft', -- 'spec_draft', 'spec_ready', 'active', 'in_progress', 'completed'
+    status TEXT DEFAULT 'spec_draft', -- 'spec_draft', 'spec_ready', 'active', 'in_progress', 'pr_open', 'completed'
     owner TEXT,                       -- Who is working on this
     blocked_by TEXT,                  -- Comma-separated refs (bug-44,improvement-31)
     source_inbox_id INTEGER,          -- Which inbox item it came from (nullable)
     doc_path TEXT,
+    pr_number INTEGER,                -- PR number if PR is open
+    pr_url TEXT,                      -- Full PR URL
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(project_id, number)
@@ -57,7 +59,7 @@ CREATE TABLE IF NOT EXISTS improvements (
 
 -- ═══════════════════════════════════════════════════════════════
 -- BUGS: Bug tracking per project
--- Lifecycle: spec_draft → spec_ready → active → in_progress → resolved
+-- Lifecycle: spec_draft → spec_ready → active → in_progress → pr_open → resolved
 -- ═══════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS bugs (
     id INTEGER PRIMARY KEY,
@@ -66,11 +68,13 @@ CREATE TABLE IF NOT EXISTS bugs (
     slug TEXT,
     title TEXT NOT NULL,
     priority TEXT DEFAULT 'medium',
-    status TEXT DEFAULT 'spec_draft', -- 'spec_draft', 'spec_ready', 'active', 'in_progress', 'resolved'
+    status TEXT DEFAULT 'spec_draft', -- 'spec_draft', 'spec_ready', 'active', 'in_progress', 'pr_open', 'resolved'
     owner TEXT,                       -- Who is working on this
     blocked_by TEXT,                  -- Comma-separated refs (bug-44,improvement-31)
     source_inbox_id INTEGER,          -- Which inbox item it came from (nullable)
     doc_path TEXT,
+    pr_number INTEGER,                -- PR number if PR is open
+    pr_url TEXT,                      -- Full PR URL
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(project_id, number)

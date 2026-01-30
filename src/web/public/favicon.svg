@@ -1,0 +1,18 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <path d="M420 80 H 130 C 100 80 100 80 100 110 V 460 C 100 480 120 480 130 480 H 430 C 450 480 450 460 450 450 V 110 C 450 90 440 80 420 80 Z" fill="#F5E1C8" stroke="#333" stroke-width="5"/>
+  <path d="M430 450 H 130" stroke="#D4C0A8" stroke-width="4"/>
+  <path d="M430 460 H 130" stroke="#D4C0A8" stroke-width="4"/>
+
+  <rect x="80" y="50" width="340" height="400" rx="10" ry="10" fill="#4B0082" stroke="#2E0050" stroke-width="5"/>
+
+  <rect x="80" y="50" width="60" height="400" rx="10" ry="10" fill="#380061" />
+
+  <path d="M420 50 L 370 50 L 420 100 Z" fill="#FFD700"/>
+  <path d="M420 450 L 370 450 L 420 400 Z" fill="#FFD700"/>
+
+  <circle cx="250" cy="250" r="70" fill="none" stroke="#FFD700" stroke-width="15"/>
+  <polygon points="250,195 265,240 310,240 275,265 285,310 250,285 215,310 225,265 190,240 235,240" fill="#FFD700"/>
+
+  <rect x="160" y="350" width="180" height="10" rx="5" fill="#FFD700" opacity="0.6"/>
+  <rect x="160" y="370" width="180" height="10" rx="5" fill="#FFD700" opacity="0.6"/>
+</svg>

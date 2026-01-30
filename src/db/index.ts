@@ -30,6 +30,20 @@ export function getDb(): Database.Database {
   // Apply schema
   db.exec(SCHEMA);
 
+  // Run migrations for new columns (safe to run multiple times)
+  try {
+    db.exec('ALTER TABLE bugs ADD COLUMN pr_number INTEGER');
+  } catch { /* column already exists */ }
+  try {
+    db.exec('ALTER TABLE bugs ADD COLUMN pr_url TEXT');
+  } catch { /* column already exists */ }
+  try {
+    db.exec('ALTER TABLE improvements ADD COLUMN pr_number INTEGER');
+  } catch { /* column already exists */ }
+  try {
+    db.exec('ALTER TABLE improvements ADD COLUMN pr_url TEXT');
+  } catch { /* column already exists */ }
+
   return db;
 }
 
@@ -91,6 +105,8 @@ export interface Bug {
   blocked_by?: string;
   source_inbox_id?: number;
   doc_path?: string;
+  pr_number?: number;
+  pr_url?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -159,6 +175,8 @@ export interface Improvement {
   blocked_by?: string;
   source_inbox_id?: number;
   doc_path?: string;
+  pr_number?: number;
+  pr_url?: string;
   created_at?: string;
   updated_at?: string;
 }

@@ -7,9 +7,11 @@ import { homedir } from 'os';
 import {
   createBug,
   createImprovement,
+  createFeature,
   addToInbox,
   getNextBugNumber,
   getNextImprovementNumber,
+  getNextFeatureNumber,
   logActivity,
 } from '../db/index.js';
 import { getCurrentProject, generateSlug } from '../utils/project.js';
@@ -20,8 +22,8 @@ import { debouncedSync } from '../utils/git-sync.js';
 const SPELLBOOK_DIR = join(homedir(), '.spellbook', 'projects');
 
 export const logCommand = new Command('log')
-  .description('Log a bug, improvement, or feature idea')
-  .argument('<type>', 'Type: bug, improvement, or feature')
+  .description('Log a bug, improvement, feature, or idea')
+  .argument('<type>', 'Type: bug, improvement, feature, or idea')
   .argument('<title>', 'Title/description of the item')
   .option('-p, --priority <level>', 'Priority: critical, high, medium, low', 'medium')
   .option('-d, --description <text>', 'Detailed description of the issue/improvement')
@@ -178,39 +180,96 @@ export const logCommand = new Command('log')
         }
 
         case 'feature': {
-          // Features go to inbox
+          const number = getNextFeatureNumber(project.id);
+          const slug = generateSlug(title);
+          // Use centralized storage path (branch-independent)
+          const docPath = `features/${number}-${slug}/README.md`;
+          const centralFeaturesDir = join(SPELLBOOK_DIR, project.id, 'features', `${number}-${slug}`);
+          const fullDocPath = join(centralFeaturesDir, 'README.md');
+
+          // Ensure central features directory exists
+          if (!existsSync(centralFeaturesDir)) {
+            mkdirSync(centralFeaturesDir, { recursive: true });
+          }
+
+          // Create feature in database
+          createFeature({
+            project_id: project.id,
+            number,
+            name: title,
+            status: 'not_started',
+            doc_path: docPath,
+            tasks: 0,
+            source_inbox_id: undefined,
+          });
+
+          // Create markdown file
+          const content = generateFeatureMarkdown(number, title, options.priority, today, {
+            description: options.description,
+            solution: options.solution,
+          });
+          writeFileSync(fullDocPath, content, 'utf-8');
+
+          // Log activity
+          logActivity({
+            project_id: project.id,
+            item_type: 'feature',
+            item_ref: `feature-${number}`,
+            action: 'created',
+            message: title,
+            author: 'Spellbook',
+          });
+
+          // Auto-commit to git for backup
+          debouncedSync(project.id, `Created feature-${number}: ${title}`);
+
+          spinner.succeed(`Feature #${number} logged.`);
+          console.log('');
+          console.log(chalk.cyan('Feature:'), chalk.white(`#${number} - ${title}`));
+          console.log(chalk.cyan('File:'), chalk.gray(`~/.spellbook/projects/${project.id}/${docPath}`));
+          console.log(chalk.cyan('Priority:'), chalk.yellow(options.priority));
+          console.log('');
+          console.log(
+            chalk.gray('Next:'),
+            `Run ${chalk.white(`/implement feature-${number}`)} when ready to implement.`
+          );
+          break;
+        }
+
+        case 'idea': {
+          // Ideas go to inbox for later triage
           addToInbox({
             project_id: project.id,
             description: title,
-            type: 'feature',
+            type: 'idea',
             priority: options.priority || 'medium',
           });
 
           // Log activity
           logActivity({
             project_id: project.id,
-            item_type: 'feature',
+            item_type: 'idea',
             item_ref: 'inbox',
             action: 'created',
             message: title,
             author: 'Spellbook',
           });
 
-          spinner.succeed('Feature idea added to inbox.');
+          spinner.succeed('Idea added to inbox.');
           console.log('');
-          console.log(chalk.cyan('Feature:'), chalk.white(title));
-          console.log(chalk.cyan('Location:'), chalk.gray('Feature Inbox (run `spellbook roadmap` to update)'));
+          console.log(chalk.cyan('Idea:'), chalk.white(title));
+          console.log(chalk.cyan('Location:'), chalk.gray('Inbox (run `spellbook inbox` to view)'));
           console.log('');
           console.log(
             chalk.gray('Next:'),
-            `Run ${chalk.white('/plan')} when ready to fully plan the feature.`
+            `Review inbox and promote to feature/bug/improvement when ready.`
           );
           break;
         }
 
         default:
           spinner.fail(`Unknown type: ${type}`);
-          error('Valid types: bug, improvement, feature');
+          error('Valid types: bug, improvement, feature, idea');
           process.exit(1);
       }
     } catch (err) {
@@ -332,6 +391,54 @@ ${location}
 
 ## Notes
 [Additional context]
+
+---
+
+## Changelog
+
+_Updated during implementation for context handover._
+
+| Date | Change | Author |
+|------|--------|--------|
+| ${date} | Created | Spellbook |
+`;
+}
+
+interface FeatureDetails {
+  description?: string;
+  solution?: string;
+}
+
+function generateFeatureMarkdown(
+  number: number,
+  title: string,
+  priority: string,
+  date: string,
+  details: FeatureDetails = {}
+): string {
+  const description = details.description || '[Feature description]';
+  const solution = details.solution || '';
+
+  return `# Feature ${number}: ${title}
+
+**Status:** 🔴 Not Started
+**Priority:** ${priority.charAt(0).toUpperCase() + priority.slice(1)}
+**Created:** ${date}
+
+## Overview
+${description}
+${solution ? `\n## Proposed Approach\n${solution}\n` : ''}
+## Tasks
+- [ ] Task 1
+- [ ] Task 2
+- [ ] Task 3
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Technical Notes
+[Implementation details, architecture decisions, etc.]
 
 ---
 

@@ -3,6 +3,119 @@
 
 const API_BASE = '/api';
 
+// ==================== PERFORMANCE CONFIGURATION ====================
+
+const PERF_CONFIG = {
+  // Polling intervals (ms)
+  KANBAN_POLL_INTERVAL: 10000,        // Was 5000, reduced frequency
+  GIT_SYNC_POLL_INTERVAL: 30000,      // Git sync polling
+  DOC_REFRESH_INTERVAL: 5000,         // Was 3000, reduced frequency
+
+  // Terminal resize debounce
+  RESIZE_DEBOUNCE_MS: 100,            // Debounce resize events
+
+  // Fit terminal retry config
+  FIT_RETRY_DELAYS: [100, 300, 600],  // Reduced from 4 attempts to 3
+
+  // Debug mode - set to false for production
+  DEBUG_MODE: false,
+};
+
+// Debug logger that respects config
+function debugLog(...args) {
+  if (PERF_CONFIG.DEBUG_MODE) {
+    console.log(...args);
+  }
+}
+
+// Track active timeouts for cleanup
+const activeTimeouts = new Set();
+
+function safeSetTimeout(callback, delay) {
+  const id = setTimeout(() => {
+    activeTimeouts.delete(id);
+    callback();
+  }, delay);
+  activeTimeouts.add(id);
+  return id;
+}
+
+function safeClearTimeout(id) {
+  if (id) {
+    clearTimeout(id);
+    activeTimeouts.delete(id);
+  }
+}
+
+// Track visibility state for pausing polling when tab is hidden
+let isPageVisible = true;
+document.addEventListener('visibilitychange', () => {
+  isPageVisible = document.visibilityState === 'visible';
+  if (isPageVisible) {
+    // Resume polling when page becomes visible
+    fetchData().then(() => renderKanban());
+  }
+});
+
+// ==================== SESSION CLEANUP ====================
+
+/**
+ * Properly cleanup a terminal session to prevent memory leaks
+ * Disconnects ResizeObserver, removes window event listeners, closes WebSocket, disposes terminal
+ */
+function cleanupSession(session) {
+  if (!session) return;
+
+  // Clear any pending resize timeouts
+  if (session.resizeTimeout) {
+    clearTimeout(session.resizeTimeout);
+    session.resizeTimeout = null;
+  }
+  if (session.windowResizeTimeout) {
+    clearTimeout(session.windowResizeTimeout);
+    session.windowResizeTimeout = null;
+  }
+
+  // Disconnect ResizeObserver if exists
+  if (session.resizeObserver) {
+    try {
+      session.resizeObserver.disconnect();
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+    session.resizeObserver = null;
+  }
+
+  // Remove window resize listener if exists
+  if (session.handleWindowResize) {
+    window.removeEventListener('resize', session.handleWindowResize);
+    session.handleWindowResize = null;
+  }
+
+  // Close WebSocket
+  if (session.ws) {
+    try {
+      session.ws.close();
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+    session.ws = null;
+  }
+
+  // Dispose terminal
+  if (session.term) {
+    try {
+      session.term.dispose();
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+    session.term = null;
+  }
+
+  // Clear fitAddon reference
+  session.fitAddon = null;
+}
+
 // Helper: Send command to terminal with separate Enter key (required for PTY)
 function sendTerminalCommand(ws, text, callback) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -13,6 +126,231 @@ function sendTerminalCommand(ws, text, callback) {
     ws.send(JSON.stringify({ type: 'input', data: '\r' }));
     if (callback) setTimeout(callback, 100);
   }, 50);
+}
+
+// Helper: Check if terminal is scrolled to bottom (within threshold)
+function isTerminalAtBottom(term, threshold = 50) {
+  const buffer = term.buffer.active;
+  const viewportY = buffer.viewportY;
+  const baseY = buffer.baseY;
+  return baseY - viewportY <= threshold;
+}
+
+// Helper: Smart scroll - only scroll to bottom if user was already at bottom
+function smartScrollToBottom(term) {
+  if (isTerminalAtBottom(term)) {
+    term.scrollToBottom();
+  }
+}
+
+// Helper: Setup drag-and-drop and paste image functionality for terminal containers
+function setupTerminalDropZone(container, session) {
+  if (!container || !session) {
+    debugLog('[DropZone] Missing container or session', { container, session });
+    return;
+  }
+
+  debugLog('[DropZone] Setting up drop zone for', container.id || container.className);
+
+  // Allowed file types for drag and drop
+  const allowedImageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml'];
+  const allowedFileExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.pdf', '.txt', '.md', '.json', '.js', '.ts', '.py', '.sh'];
+
+  function isAllowedFile(file) {
+    if (allowedImageTypes.includes(file.type)) return true;
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    return allowedFileExtensions.includes(ext);
+  }
+
+  function isImageFile(file) {
+    return allowedImageTypes.includes(file.type) || file.type.startsWith('image/');
+  }
+
+  async function uploadFile(file) {
+    debugLog('[DropZone] Uploading file:', file.name, file.type, file.size);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch(`${API_BASE}/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      debugLog('[DropZone] Upload response status:', response.status);
+
+      if (!response.ok) {
+        const error = await response.json();
+        console.error('[DropZone] Upload failed:', error);
+        return null;
+      }
+
+      const data = await response.json();
+      debugLog('[DropZone] Upload success:', data);
+      return data.path;
+    } catch (err) {
+      console.error('[DropZone] Upload error:', err);
+      return null;
+    }
+  }
+
+  function injectIntoTerminal(filePath, isImage) {
+    debugLog('[DropZone] Injecting into terminal:', filePath, 'isImage:', isImage);
+    debugLog('[DropZone] Session state:', {
+      hasWs: !!session.ws,
+      wsState: session.ws?.readyState,
+      hasTerm: !!session.term,
+    });
+
+    // Method 1: Use WebSocket if connected
+    if (session.ws?.readyState === WebSocket.OPEN) {
+      const message = isImage
+        ? `Please analyze this image: ${filePath}`
+        : `I've uploaded a file: ${filePath}`;
+      debugLog('[DropZone] Sending via WebSocket:', message);
+      sendTerminalCommand(session.ws, message);
+      return;
+    }
+
+    // Method 2: Use term.write if terminal exists
+    if (session.term) {
+      const message = isImage
+        ? `Please analyze this image: ${filePath}`
+        : `I've uploaded a file: ${filePath}`;
+      debugLog('[DropZone] Writing via term.write:', message);
+      session.term.write(message + '\r');
+      return;
+    }
+
+    console.error('[DropZone] No way to inject into terminal - no WebSocket or term available');
+  }
+
+  // Get the actual xterm screen element for better event targeting
+  const getDropTarget = () => {
+    const xtermScreen = container.querySelector('.xterm-screen');
+    return xtermScreen || container;
+  };
+
+  // Prevent default for all drag events to enable drop
+  const preventDefaults = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  // Add event listeners to both container and xterm-screen (when available)
+  const addDropListeners = (target) => {
+    // Drag enter/over handler
+    target.addEventListener('dragenter', (e) => {
+      preventDefaults(e);
+      container.classList.add('drag-over');
+      debugLog('[DropZone] Drag enter on', target.className);
+    }, { capture: true });
+
+    target.addEventListener('dragover', (e) => {
+      preventDefaults(e);
+      container.classList.add('drag-over');
+    }, { capture: true });
+
+    // Drag leave handler
+    target.addEventListener('dragleave', (e) => {
+      preventDefaults(e);
+      // Only remove highlight if leaving the container entirely
+      if (!container.contains(e.relatedTarget)) {
+        container.classList.remove('drag-over');
+      }
+    }, { capture: true });
+
+    // Drop handler
+    target.addEventListener('drop', async (e) => {
+      preventDefaults(e);
+      container.classList.remove('drag-over');
+      debugLog('[DropZone] Drop event received!', e.dataTransfer.files);
+
+      const files = Array.from(e.dataTransfer.files);
+      debugLog('[DropZone] Files dropped:', files.length, files.map(f => f.name));
+
+      const validFiles = files.filter(isAllowedFile);
+      debugLog('[DropZone] Valid files:', validFiles.length);
+
+      if (validFiles.length === 0) {
+        debugLog('[DropZone] No valid files to upload');
+        // Show feedback in terminal
+        if (session.term) {
+          session.term.write('\r\n[Spellbook] No valid files dropped. Supported: images, pdf, txt, md, json, js, ts, py, sh\r\n');
+        }
+        return;
+      }
+
+      for (const file of validFiles) {
+        // Show upload progress
+        if (session.term) {
+          session.term.write(`\r\n[Spellbook] Uploading ${file.name}...\r\n`);
+        }
+
+        const filePath = await uploadFile(file);
+        if (filePath) {
+          injectIntoTerminal(filePath, isImageFile(file));
+        } else {
+          if (session.term) {
+            session.term.write(`\r\n[Spellbook] Failed to upload ${file.name}\r\n`);
+          }
+        }
+      }
+    }, { capture: true });
+  };
+
+  // Add listeners to container immediately
+  addDropListeners(container);
+
+  // Also try to add to xterm-screen after a delay (xterm might not be rendered yet)
+  setTimeout(() => {
+    const xtermScreen = container.querySelector('.xterm-screen');
+    if (xtermScreen) {
+      debugLog('[DropZone] Found .xterm-screen, adding listeners');
+      addDropListeners(xtermScreen);
+    }
+  }, 500);
+
+  // Paste handler for images from clipboard (attach to document to catch all pastes when terminal focused)
+  const handlePaste = async (e) => {
+    // Only handle if terminal is focused or mouse is over container
+    if (!container.contains(document.activeElement) && !container.matches(':hover')) {
+      return;
+    }
+
+    const items = Array.from(e.clipboardData?.items || []);
+    const imageItems = items.filter(item => item.type.startsWith('image/'));
+
+    if (imageItems.length === 0) return;
+
+    e.preventDefault();
+    debugLog('[DropZone] Paste event with images:', imageItems.length);
+
+    for (const item of imageItems) {
+      const blob = item.getAsFile();
+      if (!blob) continue;
+
+      // Create a proper file with a name
+      const extension = blob.type.split('/')[1] || 'png';
+      const fileName = `clipboard-${Date.now()}.${extension}`;
+      const file = new File([blob], fileName, { type: blob.type });
+
+      // Show progress
+      if (session.term) {
+        session.term.write(`\r\n[Spellbook] Uploading pasted image...\r\n`);
+      }
+
+      const filePath = await uploadFile(file);
+      if (filePath) {
+        injectIntoTerminal(filePath, true);
+      }
+    }
+  };
+
+  // Attach paste handler to document (will filter based on focus)
+  document.addEventListener('paste', handlePaste);
+
+  debugLog('[DropZone] Terminal drop zone initialized for', container.id || 'terminal');
 }
 
 // ==================== STATE ====================
@@ -27,11 +365,14 @@ const state = {
   kanbanFilter: 'all',
   kanbanPriorityFilter: 'all',
   kanbanSort: 'priority',
+  kanbanSearch: '',
   inboxFilter: 'all',
   selectedInboxItem: null,
-  currentView: 'kanban', // 'dashboard' | 'kanban' | 'inbox' | 'investigate' | 'terminals'
+  currentView: 'kanban', // 'dashboard' | 'kanban' | 'inbox' | 'investigate' | 'terminals' | 'knowledge'
   knowledgeBase: [],
   dashboardLoaded: false,
+  kbCategory: 'all',
+  selectedKBDoc: null,
 };
 
 // Investigation sessions
@@ -48,14 +389,319 @@ const sessions = {
     term: null,
     fitAddon: null,
     ws: null,
+    tmuxSession: null,
   },
-  // { 'improvement-32': { terminalId, term, ws, fitAddon, itemType, itemNumber, docPath, planContent, planExists, ... } }
+  worktreeTerminal: {
+    terminalId: null,
+    term: null,
+    fitAddon: null,
+    ws: null,
+    tmuxSession: null,
+  },
+  // { 'improvement-32': { terminalId, term, ws, fitAddon, itemType, itemNumber, docPath, planContent, planExists, tmuxSession, ... } }
   planning: {},
   activePlanningSession: null, // Currently visible planning session key
 };
 
+// Session persistence storage key
+const SESSION_STORAGE_KEY = 'spellbook-sessions';
+
 // Document refresh interval
 let docRefreshInterval = null;
+
+// Kanban polling interval
+let kanbanInterval = null;
+
+// ==================== SESSION PERSISTENCE ====================
+
+/**
+ * Save session info to localStorage for reconnection after refresh
+ */
+function saveSessionsToStorage() {
+  const persistedSessions = {};
+
+  // Save planning sessions that have tmux
+  for (const [key, session] of Object.entries(sessions.planning)) {
+    if (session.tmuxSession) {
+      persistedSessions[key] = {
+        tmuxSession: session.tmuxSession,
+        itemType: session.itemType,
+        itemNumber: session.itemNumber,
+        docPath: session.docPath,
+        workingDir: session.workingDir,
+      };
+    }
+  }
+
+  // Save quickchat if it has tmux
+  if (sessions.quickChat?.tmuxSession) {
+    persistedSessions['quickChat'] = {
+      tmuxSession: sessions.quickChat.tmuxSession,
+    };
+  }
+
+  localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(persistedSessions));
+  debugLog('[Spellbook] Saved sessions to storage:', Object.keys(persistedSessions));
+}
+
+/**
+ * Load saved session info from localStorage
+ */
+function loadSessionsFromStorage() {
+  try {
+    const stored = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!stored) return {};
+    return JSON.parse(stored);
+  } catch (err) {
+    console.error('[Spellbook] Failed to load sessions from storage:', err);
+    return {};
+  }
+}
+
+/**
+ * Clear saved sessions from localStorage
+ */
+function clearSessionsFromStorage() {
+  localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
+/**
+ * Check for persisted tmux sessions and offer to reconnect
+ */
+async function checkPersistedSessions() {
+  try {
+    const res = await fetch(`${API_BASE}/terminals/persisted`);
+    const data = await res.json();
+
+    if (!data.available || !data.sessions || data.sessions.length === 0) {
+      debugLog('[Spellbook] No persisted tmux sessions found');
+      return;
+    }
+
+    debugLog('[Spellbook] Found persisted tmux sessions:', data.sessions);
+
+    // Load our saved session mapping
+    const savedSessions = loadSessionsFromStorage();
+    const matchedSessions = [];
+
+    // Match persisted tmux sessions with our saved session keys
+    for (const tmuxSession of data.sessions) {
+      // Check if we have a saved session that matches this tmux session
+      for (const [key, savedInfo] of Object.entries(savedSessions)) {
+        if (savedInfo.tmuxSession === tmuxSession.name) {
+          matchedSessions.push({
+            key,
+            tmuxSession: tmuxSession.name,
+            ...savedInfo,
+            created: tmuxSession.created,
+          });
+        }
+      }
+    }
+
+    if (matchedSessions.length === 0) {
+      debugLog('[Spellbook] No matching sessions to reconnect');
+      return;
+    }
+
+    // Show reconnection prompt
+    showReconnectPrompt(matchedSessions);
+
+  } catch (err) {
+    console.error('[Spellbook] Failed to check persisted sessions:', err);
+  }
+}
+
+/**
+ * Show a prompt to reconnect to persisted sessions
+ */
+function showReconnectPrompt(matchedSessions) {
+  const container = document.createElement('div');
+  container.id = 'reconnect-prompt';
+  container.className = 'fixed top-4 right-4 z-50 bg-spellbook-card border border-spellbook-accent rounded-lg shadow-lg p-4 max-w-md';
+
+  const planningMatches = matchedSessions.filter(s => s.key !== 'quickChat');
+  const hasQuickChat = matchedSessions.some(s => s.key === 'quickChat');
+
+  container.innerHTML = `
+    <div class="flex items-start justify-between mb-3">
+      <div class="flex items-center gap-2">
+        <span class="text-spellbook-accent text-lg">&#9889;</span>
+        <h3 class="font-semibold text-spellbook-text">Reconnect Sessions</h3>
+      </div>
+      <button onclick="dismissReconnectPrompt()" class="text-spellbook-muted hover:text-spellbook-text">&times;</button>
+    </div>
+    <p class="text-sm text-spellbook-muted mb-3">
+      Found ${matchedSessions.length} session${matchedSessions.length !== 1 ? 's' : ''} from your previous visit:
+    </p>
+    <div class="space-y-2 mb-4">
+      ${hasQuickChat ? `
+        <div class="flex items-center justify-between p-2 bg-spellbook-bg rounded">
+          <span class="text-sm text-spellbook-text">Quick Chat</span>
+          <button onclick="reconnectSession('quickChat')" class="px-2 py-1 text-xs bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30">
+            Reconnect
+          </button>
+        </div>
+      ` : ''}
+      ${planningMatches.map(s => `
+        <div class="flex items-center justify-between p-2 bg-spellbook-bg rounded">
+          <span class="text-sm text-spellbook-text">${s.key}</span>
+          <button onclick="reconnectSession('${s.key}')" class="px-2 py-1 text-xs bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30">
+            Reconnect
+          </button>
+        </div>
+      `).join('')}
+    </div>
+    <div class="flex gap-2">
+      <button onclick="reconnectAllSessions()" class="flex-1 px-3 py-2 bg-spellbook-accent text-spellbook-bg text-sm rounded hover:bg-spellbook-accent/80">
+        Reconnect All
+      </button>
+      <button onclick="dismissReconnectPrompt(true)" class="px-3 py-2 bg-spellbook-card border border-spellbook-border text-spellbook-muted text-sm rounded hover:border-red-400 hover:text-red-400">
+        Dismiss
+      </button>
+    </div>
+  `;
+
+  document.body.appendChild(container);
+
+  // Store matched sessions for reconnection
+  window._pendingReconnectSessions = matchedSessions;
+}
+
+/**
+ * Dismiss the reconnect prompt
+ */
+function dismissReconnectPrompt(clearStorage = false) {
+  const prompt = document.getElementById('reconnect-prompt');
+  if (prompt) {
+    prompt.remove();
+  }
+  if (clearStorage) {
+    clearSessionsFromStorage();
+  }
+  delete window._pendingReconnectSessions;
+}
+
+/**
+ * Reconnect to a specific session
+ */
+async function reconnectSession(sessionKey) {
+  const savedSessions = loadSessionsFromStorage();
+  const savedInfo = savedSessions[sessionKey];
+
+  if (!savedInfo) {
+    console.error('[Spellbook] No saved info for session:', sessionKey);
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/terminals/reconnect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionName: savedInfo.tmuxSession,
+        cwd: savedInfo.workingDir || state.project?.path,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      console.error('[Spellbook] Failed to reconnect:', err);
+      updateActivity(`Failed to reconnect ${sessionKey}: ${err.error}`);
+      return;
+    }
+
+    const data = await res.json();
+    debugLog('[Spellbook] Reconnected session:', data);
+
+    if (sessionKey === 'quickChat') {
+      sessions.quickChat.terminalId = data.terminalId;
+      sessions.quickChat.tmuxSession = data.tmuxSession;
+      await connectTerminal('quickChat', document.getElementById('quick-chat-terminal'));
+      updateActivity('Quick Chat reconnected');
+    } else {
+      // Reconnect planning session
+      sessions.planning[sessionKey] = {
+        terminalId: data.terminalId,
+        term: null,
+        ws: null,
+        fitAddon: null,
+        itemType: savedInfo.itemType,
+        itemNumber: savedInfo.itemNumber,
+        docPath: savedInfo.docPath,
+        planContent: null,
+        planExists: false,
+        status: 'active',
+        workingDir: savedInfo.workingDir,
+        tmuxSession: data.tmuxSession,
+      };
+
+      updateActivity(`Reconnected to ${sessionKey}`);
+      refreshItermSessionsForPills();
+    }
+
+    // Update storage
+    saveSessionsToStorage();
+
+    // Remove this session from pending list
+    if (window._pendingReconnectSessions) {
+      window._pendingReconnectSessions = window._pendingReconnectSessions.filter(s => s.key !== sessionKey);
+      if (window._pendingReconnectSessions.length === 0) {
+        dismissReconnectPrompt();
+      } else {
+        // Refresh prompt
+        dismissReconnectPrompt();
+        showReconnectPrompt(window._pendingReconnectSessions);
+      }
+    }
+
+  } catch (err) {
+    console.error('[Spellbook] Failed to reconnect session:', err);
+    updateActivity(`Failed to reconnect ${sessionKey}`);
+  }
+}
+
+/**
+ * Reconnect all pending sessions
+ */
+async function reconnectAllSessions() {
+  const pendingSessions = window._pendingReconnectSessions || [];
+  dismissReconnectPrompt();
+
+  for (const session of pendingSessions) {
+    await reconnectSession(session.key);
+  }
+}
+
+/**
+ * Save session before page unload
+ */
+function setupUnloadHandler() {
+  window.addEventListener('beforeunload', () => {
+    // Save session state
+    saveSessionsToStorage();
+
+    // Clean up all active timeouts
+    activeTimeouts.forEach(id => clearTimeout(id));
+    activeTimeouts.clear();
+
+    // Clean up polling intervals
+    if (gitSyncInterval) clearInterval(gitSyncInterval);
+    if (docRefreshInterval) clearInterval(docRefreshInterval);
+    if (kanbanInterval) clearInterval(kanbanInterval);
+
+    // Clean up all sessions
+    if (sessions.quickChat) {
+      cleanupSession(sessions.quickChat);
+    }
+    Object.values(sessions.planning).forEach(session => {
+      cleanupSession(session);
+    });
+    Object.values(investigations.sessions).forEach(session => {
+      cleanupSession(session);
+    });
+  });
+}
 
 // Current planning doc tab
 let currentPlanningTab = 'document';
@@ -63,66 +709,74 @@ let currentPlanningTab = 'document';
 // ==================== INITIALIZATION ====================
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // Initialize view state first - ensure kanban view is properly displayed
+  switchMainView('kanban');
+
   await loadProjects();
   await fetchData();
   await loadWorktrees();
   await loadBranch();
   await loadKnowledgeBase();
   await loadRecentActivity();
+  startGitSyncPolling();
   renderKanban();
   initDragAndDrop();
   updateStats();
-  renderSessionPills();
+  startItermSessionsRefresh();
 
-  // Initialize action button with default handler
-  const implBtn = document.getElementById('start-impl-btn');
-  if (implBtn) {
-    implBtn.onclick = startImplementation;
-  }
-
-  // Initialize planning view close button with explicit event listener
-  // Use document-level delegation to ensure it works even with dynamic content
-  document.addEventListener('click', (e) => {
-    const target = e.target;
-    // Check for close button by ID or by content
-    if (target.id === 'close-planning-btn' ||
-        (target.tagName === 'BUTTON' && target.textContent?.includes('Close') &&
-         target.closest('#planning-view'))) {
-      console.log('[Spellbook] Close button clicked via delegation');
-      e.preventDefault();
-      e.stopPropagation();
-      closePlanningView();
-    }
-  }, true); // Use capture phase to get event first
-
-  // Also add direct listener as backup
+  // Initialize planning view close button - single handler only
   const closePlanningBtn = document.getElementById('close-planning-btn');
   if (closePlanningBtn) {
-    closePlanningBtn.onclick = (e) => {
-      console.log('[Spellbook] Close button clicked directly');
+    closePlanningBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      debugLog('[Spellbook] Close button clicked');
       closePlanningView();
-    };
+    });
   }
 
+  // Set up session persistence
+  setupUnloadHandler();
+
+  // Removed: tmux session reconnection - now using external iTerm
+  // await checkPersistedSessions();
+
   // Start Quick Chat terminal
-  await initQuickChatTerminal();
+  if (!sessions.quickChat?.terminalId) {
+    await initQuickChatTerminal();
+  }
 
-  // Resize handler
-  window.addEventListener('resize', handleResize);
+  // Extra fit() calls after initialization to handle layout timing
+  // The browser needs time to compute dimensions after DOM is rendered
+  setTimeout(handleResize, 100);
+  setTimeout(handleResize, 500);
+  setTimeout(handleResize, 1000);
 
-  // Start polling for kanban updates
-  setInterval(async () => {
+  // Resize handler with debouncing
+  let resizeTimeout = null;
+  window.addEventListener('resize', () => {
+    if (resizeTimeout) clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(handleResize, PERF_CONFIG.RESIZE_DEBOUNCE_MS);
+  });
+
+  // Start polling for kanban updates (pauses when tab is hidden)
+  kanbanInterval = setInterval(async () => {
+    if (!isPageVisible) return; // Skip polling when tab is hidden
     await fetchData();
     await loadRecentActivity();
     renderKanban();
     updateStats();
-  }, 5000);
+  }, PERF_CONFIG.KANBAN_POLL_INTERVAL);
 });
 
 function handleResize() {
   // Resize Quick Chat terminal
   if (sessions.quickChat?.fitAddon) {
     sessions.quickChat.fitAddon.fit();
+  }
+  // Resize Worktree terminal
+  if (sessions.worktreeTerminal?.fitAddon) {
+    sessions.worktreeTerminal.fitAddon.fit();
   }
   // Resize active planning terminal
   if (sessions.activePlanningSession) {
@@ -174,6 +828,29 @@ async function fetchData() {
   }
 }
 
+// Refresh kanban board - fetches fresh data and re-renders
+async function refreshKanban() {
+  const refreshBtn = document.querySelector('[onclick="refreshKanban()"]');
+  if (refreshBtn) {
+    refreshBtn.textContent = '↻ Refreshing...';
+    refreshBtn.disabled = true;
+  }
+
+  try {
+    await fetchData();
+    renderKanban();
+    updateStats();
+    updateActivity('Kanban board refreshed');
+  } catch (err) {
+    console.error('Failed to refresh kanban:', err);
+  } finally {
+    if (refreshBtn) {
+      refreshBtn.textContent = '↻ Refresh';
+      refreshBtn.disabled = false;
+    }
+  }
+}
+
 function updateInboxBadge() {
   const badge = document.getElementById('inbox-badge');
   if (badge) {
@@ -189,6 +866,422 @@ async function loadBranch() {
     document.getElementById('branch-display').textContent = `branch: ${data.branch}`;
   } catch (err) {
     console.error('Failed to load branch:', err);
+  }
+}
+
+// ==================== GIT SYNC STATUS ====================
+
+let gitSyncInterval = null;
+
+// Toast notification system for better error display
+function showToast(message, type = 'info', duration = 5000) {
+  const container = document.getElementById('toast-container');
+  if (!container) {
+    debugLog(`[Toast ${type}]`, message);
+    return;
+  }
+
+  const toast = document.createElement('div');
+  const colors = {
+    error: 'bg-red-500/90 border-red-400',
+    warning: 'bg-yellow-500/90 border-yellow-400 text-black',
+    success: 'bg-green-500/90 border-green-400',
+    info: 'bg-blue-500/90 border-blue-400',
+  };
+
+  toast.className = `${colors[type] || colors.info} border rounded-lg px-4 py-3 shadow-lg text-sm font-medium animate-slide-in flex items-start gap-2 max-w-full`;
+
+  const icons = {
+    error: '⚠️',
+    warning: '⚡',
+    success: '✓',
+    info: 'ℹ️',
+  };
+
+  toast.innerHTML = `
+    <span class="shrink-0">${icons[type] || icons.info}</span>
+    <span class="flex-1">${message}</span>
+    <button onclick="this.parentElement.remove()" class="shrink-0 opacity-70 hover:opacity-100 ml-2">×</button>
+  `;
+
+  container.appendChild(toast);
+
+  if (duration > 0) {
+    setTimeout(() => {
+      toast.classList.add('animate-slide-out');
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
+}
+
+// Load uncommitted changes status
+async function loadUncommittedStatus() {
+  const indicator = document.getElementById('uncommitted-indicator');
+  const dot = document.getElementById('uncommitted-dot');
+  const text = document.getElementById('uncommitted-text');
+  const filesList = document.getElementById('uncommitted-files');
+
+  if (!indicator || !dot || !text) return;
+
+  try {
+    const res = await fetch(`${API_BASE}/git/uncommitted`);
+    const data = await res.json();
+
+    if (data.error || !data.hasUncommitted) {
+      indicator.classList.add('hidden');
+      return;
+    }
+
+    indicator.classList.remove('hidden');
+
+    const { count, files, modifiedCount, stagedCount, untrackedCount } = data;
+
+    // Set text
+    const parts = [];
+    if (stagedCount > 0) parts.push(`${stagedCount} staged`);
+    if (modifiedCount > 0) parts.push(`${modifiedCount} modified`);
+    if (untrackedCount > 0) parts.push(`${untrackedCount} untracked`);
+    text.textContent = parts.length > 0 ? parts.join(', ') : `${count} uncommitted`;
+
+    // Set color based on severity
+    if (count > 10) {
+      dot.className = 'w-2 h-2 rounded-full bg-red-500';
+      text.className = 'text-red-400';
+      indicator.className = indicator.className.replace('border-spellbook-border', 'border-red-500/50');
+    } else if (count > 5) {
+      dot.className = 'w-2 h-2 rounded-full bg-yellow-500';
+      text.className = 'text-yellow-400';
+      indicator.className = indicator.className.replace('border-spellbook-border', 'border-yellow-500/50');
+    } else {
+      dot.className = 'w-2 h-2 rounded-full bg-yellow-500';
+      text.className = 'text-yellow-400';
+      indicator.className = indicator.className.replace(/border-(red|yellow)-500\/50/g, 'border-spellbook-border');
+    }
+
+    // Populate tooltip with file list
+    if (filesList) {
+      filesList.innerHTML = files.slice(0, 20).map(f => {
+        const statusColors = {
+          added: 'text-green-400',
+          deleted: 'text-red-400',
+          modified: 'text-yellow-400',
+          renamed: 'text-blue-400',
+          untracked: 'text-gray-400',
+          conflict: 'text-red-500',
+        };
+        const statusIcons = {
+          added: '+',
+          deleted: '-',
+          modified: '~',
+          renamed: 'R',
+          untracked: '?',
+          conflict: '!',
+        };
+        return `<div class="truncate ${statusColors[f.status] || 'text-spellbook-text'}">${statusIcons[f.status] || '~'} ${f.path}</div>`;
+      }).join('');
+
+      if (files.length > 20) {
+        filesList.innerHTML += `<div class="text-spellbook-muted mt-1">...and ${files.length - 20} more</div>`;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load uncommitted status:', err);
+    indicator.classList.add('hidden');
+  }
+}
+
+// Load comparison between develop and main
+async function loadMainComparison() {
+  const indicator = document.getElementById('main-comparison-indicator');
+  const dot = document.getElementById('main-comparison-dot');
+  const text = document.getElementById('main-comparison-text');
+  const tooltip = document.getElementById('main-comparison-tooltip');
+  const pullMainBtn = document.getElementById('pull-main-btn');
+
+  if (!indicator || !dot || !text) return;
+
+  try {
+    const res = await fetch(`${API_BASE}/git/main-comparison`);
+    const data = await res.json();
+
+    if (data.error) {
+      dot.className = 'w-2 h-2 rounded-full bg-gray-500';
+      text.textContent = 'error';
+      text.className = 'text-gray-400';
+      return;
+    }
+
+    const { developAheadOfMain, developBehindMain, synced, currentBranch } = data;
+
+    if (synced) {
+      dot.className = 'w-2 h-2 rounded-full bg-green-500';
+      text.textContent = 'synced';
+      text.className = 'text-green-400';
+      if (tooltip) tooltip.textContent = 'develop is in sync with origin/main';
+      if (pullMainBtn) pullMainBtn.classList.add('hidden');
+    } else if (developBehindMain > 0 && developAheadOfMain === 0) {
+      // Only behind - need to pull main
+      const severity = developBehindMain > 10 ? 'red' : developBehindMain > 3 ? 'yellow' : 'blue';
+      dot.className = `w-2 h-2 rounded-full bg-${severity}-500`;
+      text.textContent = `↓${developBehindMain} behind`;
+      text.className = `text-${severity}-400`;
+      if (tooltip) tooltip.textContent = `develop is ${developBehindMain} commits behind origin/main. Pull main to sync.`;
+      if (pullMainBtn) pullMainBtn.classList.remove('hidden');
+    } else if (developAheadOfMain > 0 && developBehindMain === 0) {
+      // Only ahead - develop has commits not in main (normal state before PR merge)
+      dot.className = 'w-2 h-2 rounded-full bg-blue-500';
+      text.textContent = `↑${developAheadOfMain} ahead`;
+      text.className = 'text-blue-400';
+      if (tooltip) tooltip.textContent = `develop is ${developAheadOfMain} commits ahead of origin/main. Create a PR to merge into main.`;
+      if (pullMainBtn) pullMainBtn.classList.add('hidden');
+    } else {
+      // Both ahead and behind - diverged
+      const severity = developBehindMain > 5 ? 'red' : 'yellow';
+      dot.className = `w-2 h-2 rounded-full bg-${severity}-500`;
+      text.textContent = `↓${developBehindMain} ↑${developAheadOfMain}`;
+      text.className = `text-${severity}-400`;
+      if (tooltip) tooltip.textContent = `develop has diverged from origin/main: ${developAheadOfMain} ahead, ${developBehindMain} behind. Pull main first, then resolve any conflicts.`;
+      if (pullMainBtn) pullMainBtn.classList.remove('hidden');
+    }
+
+    // Update Pull Main button styling based on urgency
+    if (pullMainBtn && !pullMainBtn.classList.contains('hidden')) {
+      if (developBehindMain > 10) {
+        pullMainBtn.className = 'flex items-center gap-1 px-2 py-1 bg-red-500/20 text-red-400 border border-red-500/30 rounded text-xs hover:bg-red-500/30 transition-colors animate-pulse';
+      } else if (developBehindMain > 3) {
+        pullMainBtn.className = 'flex items-center gap-1 px-2 py-1 bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 rounded text-xs hover:bg-yellow-500/30 transition-colors';
+      } else {
+        pullMainBtn.className = 'flex items-center gap-1 px-2 py-1 bg-purple-500/20 text-purple-400 border border-purple-500/30 rounded text-xs hover:bg-purple-500/30 transition-colors';
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load main comparison:', err);
+    dot.className = 'w-2 h-2 rounded-full bg-gray-500';
+    text.textContent = 'error';
+    text.className = 'text-gray-400';
+  }
+}
+
+async function loadGitSyncStatus() {
+  const indicator = document.getElementById('git-sync-indicator');
+  const dot = document.getElementById('git-sync-dot');
+  const status = document.getElementById('git-sync-status');
+  const btn = document.getElementById('git-sync-btn');
+  const time = document.getElementById('git-sync-time');
+
+  if (!dot || !status || !indicator) return;
+
+  try {
+    indicator.classList.remove('hidden');
+    const res = await fetch(`${API_BASE}/git/sync-status?branch=develop`);
+    const data = await res.json();
+
+    if (data.error) {
+      dot.className = 'w-2 h-2 rounded-full bg-gray-500';
+      dot.title = 'Error checking sync status';
+      status.textContent = 'error';
+      status.className = 'text-gray-400';
+      btn.classList.add('hidden');
+      return;
+    }
+
+    const { ahead, behind, synced, lastFetch } = data;
+
+    if (synced) {
+      dot.className = 'w-2 h-2 rounded-full bg-green-500';
+      dot.title = 'Up to date with origin/develop';
+      status.textContent = 'synced';
+      status.className = 'text-green-400';
+      btn.classList.add('hidden');
+    } else if (behind > 0 && ahead === 0) {
+      const severity = behind > 5 ? 'red' : 'yellow';
+      dot.className = `w-2 h-2 rounded-full bg-${severity}-500`;
+      dot.title = `${behind} commits behind origin/develop`;
+      status.textContent = `↓${behind}`;
+      status.className = `text-${severity}-400`;
+      btn.classList.remove('hidden');
+      btn.textContent = 'Pull';
+    } else if (ahead > 0 && behind === 0) {
+      dot.className = 'w-2 h-2 rounded-full bg-blue-500';
+      dot.title = `${ahead} commits ahead of origin/develop`;
+      status.textContent = `↑${ahead}`;
+      status.className = 'text-blue-400';
+      btn.classList.add('hidden');
+    } else {
+      dot.className = 'w-2 h-2 rounded-full bg-purple-500';
+      dot.title = `${ahead} ahead, ${behind} behind origin/develop`;
+      status.textContent = `↓${behind} ↑${ahead}`;
+      status.className = 'text-purple-400';
+      btn.classList.remove('hidden');
+      btn.textContent = 'Sync';
+    }
+
+    if (lastFetch && time) {
+      const fetchTime = new Date(lastFetch);
+      time.textContent = fetchTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      time.title = `Last checked: ${fetchTime.toLocaleString()}`;
+    }
+  } catch (err) {
+    console.error('Failed to load git sync status:', err);
+    indicator.classList.add('hidden');
+  }
+}
+
+async function pullFromOrigin() {
+  const btn = document.getElementById('git-sync-btn');
+  const status = document.getElementById('git-sync-status');
+  const dot = document.getElementById('git-sync-dot');
+
+  if (!btn || !status) return;
+
+  const originalText = btn.textContent;
+  btn.textContent = 'Pulling...';
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/git/pull`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branch: 'develop' }),
+    });
+
+    const data = await res.json();
+
+    if (data.success) {
+      dot.className = 'w-2 h-2 rounded-full bg-green-500';
+      status.textContent = 'synced';
+      status.className = 'text-green-400';
+      btn.classList.add('hidden');
+      showToast('Pulled from origin/develop successfully', 'success');
+      updateActivity(`Pulled from origin: ${data.message}`);
+
+      await loadBranch();
+      await loadUncommittedStatus();
+      await loadMainComparison();
+      await fetchData();
+    } else {
+      dot.className = 'w-2 h-2 rounded-full bg-red-500';
+      status.textContent = 'failed';
+      status.className = 'text-red-400';
+      btn.textContent = 'Retry';
+      showToast(`Pull failed: ${data.hint || data.error}`, 'error');
+      updateActivity(`Pull failed: ${data.hint || data.error}`);
+    }
+  } catch (err) {
+    console.error('Failed to pull:', err);
+    status.textContent = 'error';
+    status.className = 'text-red-400';
+    btn.textContent = 'Retry';
+    showToast('Pull failed: Network error', 'error');
+    updateActivity('Pull failed: Network error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function startGitSyncPolling() {
+  // Load all git status info
+  loadGitSyncStatus();
+  loadUncommittedStatus();
+  loadMainComparison();
+
+  if (gitSyncInterval) clearInterval(gitSyncInterval);
+  gitSyncInterval = setInterval(() => {
+    if (!isPageVisible) return; // Skip polling when tab is hidden
+    loadGitSyncStatus();
+    loadUncommittedStatus();
+    loadMainComparison();
+  }, PERF_CONFIG.GIT_SYNC_POLL_INTERVAL);
+}
+
+async function pullMainIntoDevelop() {
+  const btn = document.getElementById('pull-main-btn');
+  const textSpan = document.getElementById('pull-main-text');
+
+  if (!btn || !textSpan) return;
+
+  // First check for uncommitted changes client-side to show better error
+  try {
+    const uncommittedRes = await fetch(`${API_BASE}/git/uncommitted`);
+    const uncommittedData = await uncommittedRes.json();
+    if (uncommittedData.hasUncommitted) {
+      showToast(`Cannot pull main: ${uncommittedData.count} uncommitted changes. Commit or stash first.`, 'warning', 8000);
+      updateActivity('Pull main blocked: uncommitted changes');
+      return;
+    }
+  } catch {
+    // Continue anyway, server will also check
+  }
+
+  const originalText = textSpan.textContent;
+  textSpan.textContent = 'Pulling...';
+  btn.disabled = true;
+  btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+  try {
+    const res = await fetch(`${API_BASE}/git/pull-main`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    const data = await res.json();
+
+    if (data.success) {
+      textSpan.textContent = 'Done!';
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+      btn.classList.add('bg-green-500/20', 'text-green-400', 'border-green-500/30');
+      btn.classList.remove('bg-purple-500/20', 'text-purple-400', 'border-purple-500/30', 'bg-yellow-500/20', 'text-yellow-400', 'border-yellow-500/30', 'bg-red-500/20', 'text-red-400', 'border-red-500/30');
+      showToast('Pulled origin/main into develop successfully', 'success');
+      updateActivity(`Pulled main into develop: ${data.message}`);
+
+      await loadGitSyncStatus();
+      await loadUncommittedStatus();
+      await loadMainComparison();
+      await loadBranch();
+      await fetchData();
+
+      setTimeout(() => {
+        textSpan.textContent = originalText;
+        btn.classList.remove('bg-green-500/20', 'text-green-400', 'border-green-500/30');
+        btn.classList.add('bg-purple-500/20', 'text-purple-400', 'border-purple-500/30');
+        // Re-check main comparison to potentially hide button
+        loadMainComparison();
+      }, 3000);
+    } else {
+      textSpan.textContent = 'Failed';
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+      btn.classList.add('bg-red-500/20', 'text-red-400', 'border-red-500/30');
+      btn.classList.remove('bg-purple-500/20', 'text-purple-400', 'border-purple-500/30', 'bg-yellow-500/20', 'text-yellow-400', 'border-yellow-500/30');
+
+      // Show detailed error in toast
+      const errorMsg = data.hint || data.error || 'Unknown error';
+      showToast(`Pull main failed: ${errorMsg}`, 'error', 10000);
+      updateActivity(`Pull main failed: ${errorMsg}`);
+
+      setTimeout(() => {
+        textSpan.textContent = originalText;
+        btn.classList.remove('bg-red-500/20', 'text-red-400', 'border-red-500/30');
+        btn.classList.add('bg-purple-500/20', 'text-purple-400', 'border-purple-500/30');
+        loadMainComparison(); // Re-style button based on current state
+      }, 5000);
+    }
+  } catch (err) {
+    console.error('Failed to pull main:', err);
+    textSpan.textContent = 'Error';
+    btn.classList.remove('opacity-50', 'cursor-not-allowed');
+    btn.classList.add('bg-red-500/20', 'text-red-400', 'border-red-500/30');
+    btn.classList.remove('bg-purple-500/20', 'text-purple-400', 'border-purple-500/30', 'bg-yellow-500/20', 'text-yellow-400', 'border-yellow-500/30');
+    showToast('Pull main failed: Network error', 'error');
+    updateActivity('Pull main failed: Network error');
+
+    setTimeout(() => {
+      textSpan.textContent = originalText;
+      btn.classList.remove('bg-red-500/20', 'text-red-400', 'border-red-500/30');
+      btn.classList.add('bg-purple-500/20', 'text-purple-400', 'border-purple-500/30');
+      loadMainComparison(); // Re-style button based on current state
+    }, 5000);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -258,10 +1351,12 @@ function renderRecentActivity(activities) {
     const title = a.item_title ? (a.item_title.length > 40 ? a.item_title.slice(0, 40) + '...' : a.item_title) : '';
 
     return `
-      <div class="px-3 py-2 hover:bg-spellbook-card/50 border-b border-spellbook-border/50 last:border-0">
+      <div class="px-3 py-2 hover:bg-spellbook-card/50 border-b border-spellbook-border/50 last:border-0 cursor-pointer transition-colors"
+           onclick="openActivityItem('${a.item_ref || ''}', '${a.item_type || ''}')"
+           title="Click to open ${a.item_ref}">
         <div class="flex items-center justify-between mb-1">
           <div class="flex items-center gap-2">
-            <span class="${typeClass} text-xs font-semibold">${a.item_ref}</span>
+            <span class="${typeClass} text-xs font-semibold hover:underline">${a.item_ref}</span>
             <span class="${actionColor} text-xs">${a.action}</span>
           </div>
           <span class="text-xs text-spellbook-muted">${dateStr}${timeStr}</span>
@@ -270,6 +1365,22 @@ function renderRecentActivity(activities) {
       </div>
     `;
   }).join('');
+}
+
+function openActivityItem(itemRef, itemType) {
+  if (!itemRef) return;
+
+  const match = itemRef.match(/(bug|improvement|feature)-(\d+)/i);
+  if (match) {
+    const type = match[1].toLowerCase();
+    const number = parseInt(match[2], 10);
+    openPlanningView(type, number);
+  } else if (itemType && itemRef) {
+    const numberMatch = itemRef.match(/(\d+)/);
+    if (numberMatch) {
+      openPlanningView(itemType.toLowerCase(), parseInt(numberMatch[1], 10));
+    }
+  }
 }
 
 // ==================== INBOX ====================
@@ -545,6 +1656,8 @@ async function initQuickChatTerminal() {
         name: 'QuickChat',
         command: 'claude',
         args: ['--dangerously-skip-permissions'],
+        useTmux: true,
+        tmuxSessionName: 'QuickChat',
       }),
     });
 
@@ -552,12 +1665,69 @@ async function initQuickChatTerminal() {
 
     const data = await res.json();
     sessions.quickChat.terminalId = data.terminalId;
+    sessions.quickChat.tmuxSession = data.tmuxSession;
 
     await connectTerminal('quickChat', document.getElementById('quick-chat-terminal'));
-    updateActivity('Quick Chat ready - use for rapid logging');
+
+    // Save session for persistence
+    saveSessionsToStorage();
+
+    updateActivity('Quick Chat connected');
   } catch (err) {
     console.error('Failed to init quick chat:', err);
     updateActivity('Failed to start Quick Chat terminal');
+  }
+}
+
+// ==================== WORKTREE TERMINAL ====================
+
+async function initWorktreeTerminal() {
+  try {
+    const statusEl = document.getElementById('worktree-terminal-status');
+    if (statusEl) {
+      statusEl.textContent = 'Connecting...';
+      statusEl.classList.remove('text-green-400', 'text-red-400');
+      statusEl.classList.add('text-yellow-400');
+    }
+
+    const res = await fetch(`${API_BASE}/terminals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cwd: state.project?.path,
+        name: 'WorktreeManager',
+        command: 'claude',
+        args: ['--dangerously-skip-permissions'],
+        useTmux: true,
+        tmuxSessionName: 'WorktreeManager',
+      }),
+    });
+
+    if (!res.ok) throw new Error('Failed to create worktree terminal');
+
+    const data = await res.json();
+    sessions.worktreeTerminal.terminalId = data.terminalId;
+    sessions.worktreeTerminal.tmuxSession = data.tmuxSession;
+
+    await connectTerminal('worktreeTerminal', document.getElementById('worktree-terminal'));
+
+    if (statusEl) {
+      statusEl.textContent = 'Connected';
+      statusEl.classList.remove('text-yellow-400', 'text-red-400');
+      statusEl.classList.add('text-green-400');
+    }
+
+    saveSessionsToStorage();
+    updateActivity('Worktree terminal connected');
+  } catch (err) {
+    console.error('Failed to init worktree terminal:', err);
+    const statusEl = document.getElementById('worktree-terminal-status');
+    if (statusEl) {
+      statusEl.textContent = 'Failed to connect';
+      statusEl.classList.remove('text-yellow-400', 'text-green-400');
+      statusEl.classList.add('text-red-400');
+    }
+    updateActivity('Failed to start worktree terminal');
   }
 }
 
@@ -567,6 +1737,8 @@ async function connectTerminal(sessionKey, container) {
   let session;
   if (sessionKey === 'quickChat') {
     session = sessions.quickChat;
+  } else if (sessionKey === 'worktreeTerminal') {
+    session = sessions.worktreeTerminal;
   } else {
     session = sessions.planning[sessionKey];
   }
@@ -578,6 +1750,8 @@ async function connectTerminal(sessionKey, container) {
     cursorStyle: 'block',
     fontSize: 13,
     fontFamily: "'Space Mono', 'Menlo', 'Monaco', monospace",
+    scrollback: 10000,
+    allowProposedApi: true,
     theme: {
       background: '#0a0a0f',
       foreground: '#e0e0e0',
@@ -603,43 +1777,152 @@ async function connectTerminal(sessionKey, container) {
   container.innerHTML = '';
   term.open(container);
 
+  // Handle Cmd+C / Ctrl+C to copy selected text
+  term.attachCustomKeyEventHandler((e) => {
+    // Allow Cmd+C (Mac) or Ctrl+C (Windows/Linux) to copy when there's a selection
+    if ((e.metaKey || e.ctrlKey) && e.key === 'c' && term.hasSelection()) {
+      const selection = term.getSelection();
+      if (selection) {
+        navigator.clipboard.writeText(selection).catch(err => {
+          console.error('[Terminal] Failed to copy:', err);
+        });
+        return false; // Prevent default terminal handling
+      }
+    }
+    // Allow Cmd+V (Mac) or Ctrl+V (Windows/Linux) to paste
+    if ((e.metaKey || e.ctrlKey) && e.key === 'v') {
+      return false; // Let browser handle paste
+    }
+    return true; // Let terminal handle other keys
+  });
+
+  // Local scroll handling - use passive listener to allow selection events
+  term.element.addEventListener('wheel', (e) => {
+    const lines = e.deltaY > 0 ? 3 : -3;
+    term.scrollLines(lines);
+  }, { passive: true });
+
+  // Focus terminal on mouse enter for better scroll handling
+  container.addEventListener('mouseenter', () => {
+    term.focus();
+  });
+
   session.term = term;
   session.fitAddon = fitAddon;
 
-  setTimeout(() => fitAddon.fit(), 100);
+  // Setup drag-and-drop and paste image functionality
+  setupTerminalDropZone(container, session);
 
-  // Connect WebSocket
+  // Helper to fit terminal and send resize to PTY
+  const doFit = () => {
+    try {
+      fitAddon.fit();
+      // After fitting, send resize to PTY if WebSocket is connected
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({
+          type: 'resize',
+          cols: term.cols,
+          rows: term.rows,
+        }));
+      }
+    } catch (e) {
+      console.error('[Terminal] fit() error:', e);
+    }
+  };
+
+  // Connect WebSocket first
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/terminal?id=${session.terminalId}`);
 
   ws.onopen = () => {
     session.ws = ws;
-    ws.send(JSON.stringify({
-      type: 'resize',
-      cols: term.cols,
-      rows: term.rows,
-    }));
+    console.log(`[Terminal] WebSocket connected for session: ${sessionKey}`);
+
+    // Update status to Connected based on session type
+    if (sessionKey === 'worktreeTerminal') {
+      const statusEl = document.getElementById('worktree-terminal-status');
+      if (statusEl) {
+        statusEl.textContent = 'Connected';
+        statusEl.classList.remove('text-red-400', 'text-yellow-400');
+        statusEl.classList.add('text-green-400');
+      }
+    } else if (sessionKey !== 'quickChat') {
+      const statusEl = document.getElementById('terminal-status');
+      if (statusEl) {
+        statusEl.textContent = '● Connected';
+        statusEl.classList.remove('text-red-400', 'text-yellow-400');
+        statusEl.classList.add('text-green-400');
+      }
+    }
+
+    // Now that WebSocket is open, do the initial fit and send resize
+    // Multiple attempts to ensure layout is computed
+    setTimeout(() => {
+      doFit();
+      // Extra resize sends to ensure PTY gets correct dimensions
+      setTimeout(doFit, 100);
+      setTimeout(doFit, 300);
+      setTimeout(doFit, 600);
+    }, 50);
   };
+
+  // Use ResizeObserver to handle container resize
+  if (window.ResizeObserver) {
+    const resizeObserver = new ResizeObserver(() => {
+      if (session.resizeTimeout) clearTimeout(session.resizeTimeout);
+      session.resizeTimeout = setTimeout(doFit, 50);
+    });
+    resizeObserver.observe(container);
+    session.resizeObserver = resizeObserver;
+  }
+
+  // Also handle window resize
+  const handleWindowResize = () => {
+    if (session.windowResizeTimeout) clearTimeout(session.windowResizeTimeout);
+    session.windowResizeTimeout = setTimeout(doFit, 100);
+  };
+  window.addEventListener('resize', handleWindowResize);
+  session.handleWindowResize = handleWindowResize;
 
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'output') {
         term.write(msg.data);
-        term.scrollToBottom(); // Auto-scroll to bottom on new output
+        smartScrollToBottom(term);
       }
     } catch {
       term.write(event.data);
-      term.scrollToBottom(); // Auto-scroll to bottom on new output
+      smartScrollToBottom(term);
     }
   };
 
   ws.onclose = () => {
+    console.log(`[Terminal] WebSocket closed for session: ${sessionKey}`);
     term.write('\r\n\x1b[33m[Terminal disconnected]\x1b[0m\r\n');
-    term.scrollToBottom();
-    if (sessionKey === 'quickChat') {
-      document.getElementById('terminal-status')?.classList.add('text-red-400');
-      document.getElementById('terminal-status')?.classList.remove('text-green-400');
+    term.scrollToBottom(); // Always scroll on disconnect message
+
+    // Don't update status if we're intentionally closing (flag set by closePlanningView)
+    if (window._intentionalClose) {
+      console.log(`[Terminal] Intentional close, skipping status update`);
+      return;
+    }
+
+    // Update status to Disconnected for unexpected disconnections
+    if (sessionKey === 'worktreeTerminal') {
+      const statusEl = document.getElementById('worktree-terminal-status');
+      if (statusEl) {
+        statusEl.textContent = 'Disconnected';
+        statusEl.classList.remove('text-green-400', 'text-yellow-400');
+        statusEl.classList.add('text-red-400');
+      }
+    } else {
+      const statusEl = document.getElementById('terminal-status');
+      if (statusEl) {
+        statusEl.textContent = '● Disconnected';
+        statusEl.classList.remove('text-green-400', 'text-yellow-400');
+        statusEl.classList.add('text-red-400');
+      }
     }
   };
 
@@ -665,33 +1948,84 @@ async function connectTerminal(sessionKey, container) {
 function switchMainView(view) {
   state.currentView = view;
 
-  // Update buttons
-  const activeClass = 'px-3 py-1 text-sm bg-spellbook-accent/20 text-spellbook-accent rounded';
-  const inactiveClass = 'px-3 py-1 text-sm bg-spellbook-card border border-spellbook-border rounded hover:border-spellbook-accent';
+  // Update sidebar navigation buttons
+  const navButtons = ['dashboard', 'kanban', 'inbox', 'investigate', 'terminals', 'knowledge', 'worktrees'];
+  navButtons.forEach(navView => {
+    const btn = document.getElementById(`nav-${navView}`);
+    if (btn) {
+      if (view === navView) {
+        btn.classList.add('active', 'bg-spellbook-accent/20');
+        btn.classList.remove('hover:bg-spellbook-accent/20');
+        const svg = btn.querySelector('svg');
+        if (svg) {
+          svg.classList.remove('text-spellbook-muted');
+          svg.classList.add('text-spellbook-accent');
+        }
+      } else {
+        btn.classList.remove('active', 'bg-spellbook-accent/20');
+        btn.classList.add('hover:bg-spellbook-accent/20');
+        const svg = btn.querySelector('svg');
+        if (svg) {
+          svg.classList.add('text-spellbook-muted');
+          svg.classList.remove('text-spellbook-accent');
+        }
+      }
+    }
+  });
 
-  document.getElementById('view-dashboard-btn').className = view === 'dashboard' ? activeClass : inactiveClass;
-  document.getElementById('view-kanban-btn').className = view === 'kanban' ? activeClass : inactiveClass;
-  document.getElementById('view-inbox-btn').className = view === 'inbox' ? activeClass : inactiveClass;
-  document.getElementById('view-investigate-btn').className = view === 'investigate' ? activeClass : inactiveClass;
-  document.getElementById('view-terminals-btn').className = view === 'terminals' ? activeClass : inactiveClass;
+  // Show/hide views - use hidden class only, CSS handles display type
+  const viewIds = [
+    'dashboard-view',
+    'kanban-view',
+    'inbox-view',
+    'investigate-view',
+    'terminal-manager-view',
+    'knowledge-view',
+    'worktrees-view'
+  ];
 
-  // Show/hide views
-  document.getElementById('dashboard-view').classList.toggle('hidden', view !== 'dashboard');
-  document.getElementById('dashboard-view').classList.toggle('flex', view === 'dashboard');
-  document.getElementById('kanban-view').classList.toggle('hidden', view !== 'kanban');
-  document.getElementById('kanban-view').classList.toggle('flex', view === 'kanban');
-  document.getElementById('inbox-view').classList.toggle('hidden', view !== 'inbox');
-  document.getElementById('inbox-view').classList.toggle('flex', view === 'inbox');
-  document.getElementById('investigate-view').classList.toggle('hidden', view !== 'investigate');
-  document.getElementById('investigate-view').classList.toggle('flex', view === 'investigate');
-  document.getElementById('terminal-manager-view').classList.toggle('hidden', view !== 'terminals');
-  document.getElementById('terminal-manager-view').classList.toggle('flex', view === 'terminals');
+  viewIds.forEach(viewId => {
+    const el = document.getElementById(viewId);
+    if (el) {
+      const viewName = viewId.replace('-view', '').replace('terminal-manager', 'terminals');
+      const shouldShow = (view === viewName) ||
+                         (view === 'terminals' && viewId === 'terminal-manager-view') ||
+                         (view === 'kanban' && viewId === 'kanban-view');
 
-  // Resize terminals
-  setTimeout(handleResize, 100);
+      // Remove any inline display style - let CSS handle it via hidden class
+      el.style.removeProperty('display');
+
+      if (shouldShow) {
+        el.classList.remove('hidden');
+      } else {
+        el.classList.add('hidden');
+      }
+    }
+  });
+
+  // Resize terminals with multiple attempts for layout timing
+  setTimeout(handleResize, 50);
+  setTimeout(handleResize, 200);
+  setTimeout(handleResize, 500);
+
+  if (view === 'kanban') {
+    // Extra resize attempts for quick chat terminal when returning to kanban
+    if (sessions.quickChat?.fitAddon) {
+      setTimeout(() => {
+        try { sessions.quickChat.fitAddon.fit(); } catch (e) { /* ignore */ }
+      }, 100);
+      setTimeout(() => {
+        try { sessions.quickChat.fitAddon.fit(); } catch (e) { /* ignore */ }
+      }, 300);
+    }
+  }
 
   if (view === 'terminals') {
     renderSessionsGrid();
+    // Preview refresh is started by renderSessionsGrid
+  } else {
+    // Stop preview refresh when leaving terminal manager view
+    stopPreviewRefresh();
   }
 
   if (view === 'dashboard') {
@@ -709,8 +2043,20 @@ function switchMainView(view) {
       const session = investigations.sessions[investigations.activeSession];
       if (session?.fitAddon) {
         setTimeout(() => session.fitAddon.fit(), 100);
+        setTimeout(() => session.fitAddon.fit(), 300);
       }
     }
+  }
+
+  if (view === 'knowledge') {
+    loadKnowledgeBase();  // Load first, render happens inside after data arrives
+  }
+
+  if (view === 'worktrees') {
+    loadWorktreesView();
+  } else {
+    // Stop worktrees refresh when leaving worktrees view
+    stopWorktreesRefresh();
   }
 }
 
@@ -988,6 +2334,8 @@ async function connectInvestigationTerminal(sessionId) {
     cursorStyle: 'block',
     fontSize: 13,
     fontFamily: "'Space Mono', 'Menlo', 'Monaco', monospace",
+    scrollback: 10000,
+    allowProposedApi: true,
     theme: {
       background: '#0a0a0f',
       foreground: '#e0e0e0',
@@ -1013,40 +2361,100 @@ async function connectInvestigationTerminal(sessionId) {
   container.innerHTML = '';
   term.open(container);
 
+  // Handle Cmd+C / Ctrl+C to copy selected text
+  term.attachCustomKeyEventHandler((e) => {
+    // Allow Cmd+C (Mac) or Ctrl+C (Windows/Linux) to copy when there's a selection
+    if ((e.metaKey || e.ctrlKey) && e.key === 'c' && term.hasSelection()) {
+      const selection = term.getSelection();
+      if (selection) {
+        navigator.clipboard.writeText(selection).catch(err => {
+          console.error('[Investigation Terminal] Failed to copy:', err);
+        });
+        return false; // Prevent default terminal handling
+      }
+    }
+    // Allow Cmd+V (Mac) or Ctrl+V (Windows/Linux) to paste
+    if ((e.metaKey || e.ctrlKey) && e.key === 'v') {
+      return false; // Let browser handle paste
+    }
+    return true; // Let terminal handle other keys
+  });
+
+  // Local scroll handling - use passive listener to allow selection events
+  term.element.addEventListener('wheel', (e) => {
+    const lines = e.deltaY > 0 ? 3 : -3;
+    term.scrollLines(lines);
+  }, { passive: true });
+
+  // Focus terminal on mouse enter for better scroll handling
+  container.addEventListener('mouseenter', () => {
+    term.focus();
+  });
+
   session.term = term;
   session.fitAddon = fitAddon;
 
-  setTimeout(() => fitAddon.fit(), 100);
+  // Setup drag-and-drop and paste image functionality
+  setupTerminalDropZone(container, session);
 
-  // Connect WebSocket
+  // Helper to fit terminal and send resize to PTY
+  const doFit = () => {
+    try {
+      fitAddon.fit();
+      // After fitting, send resize to PTY if WebSocket is connected
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({
+          type: 'resize',
+          cols: term.cols,
+          rows: term.rows,
+        }));
+      }
+    } catch (e) {
+      console.error('[Investigation Terminal] fit() error:', e);
+    }
+  };
+
+  // Connect WebSocket first
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/terminal?id=${session.terminalId}`);
 
   ws.onopen = () => {
     session.ws = ws;
-    ws.send(JSON.stringify({
-      type: 'resize',
-      cols: term.cols,
-      rows: term.rows,
-    }));
+    // Do initial fit and send resize after WebSocket is open
+    setTimeout(() => {
+      doFit();
+      setTimeout(doFit, 100);
+      setTimeout(doFit, 300);
+      setTimeout(doFit, 600);
+    }, 50);
   };
+
+  // ResizeObserver for container resize
+  if (window.ResizeObserver) {
+    const resizeObserver = new ResizeObserver(() => {
+      if (session.resizeTimeout) clearTimeout(session.resizeTimeout);
+      session.resizeTimeout = setTimeout(doFit, 50);
+    });
+    resizeObserver.observe(container);
+    session.resizeObserver = resizeObserver;
+  }
 
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'output') {
         term.write(msg.data);
-        term.scrollToBottom(); // Auto-scroll to bottom on new output
+        smartScrollToBottom(term);
       }
     } catch {
       term.write(event.data);
-      term.scrollToBottom(); // Auto-scroll to bottom on new output
+      smartScrollToBottom(term);
     }
   };
 
   ws.onclose = () => {
     term.write('\r\n\x1b[33m[Investigation ended]\x1b[0m\r\n');
-    term.scrollToBottom();
+    term.scrollToBottom(); // Always scroll on disconnect message
     session.status = 'closed';
     renderInvestigationSessions();
   };
@@ -1159,9 +2567,8 @@ async function closeInvestigation() {
     console.error('Failed to close terminal:', err);
   }
 
-  if (session.ws) session.ws.close();
-  if (session.term) session.term.dispose();
-
+  // Clean up resources properly
+  cleanupSession(session);
   session.status = 'closed';
 
   // Clear terminal view
@@ -1272,10 +2679,12 @@ async function openItemDetail(type, number) {
 
   // Show finalize button for in_progress items
   const finalizeBtn = document.getElementById('detail-finalize-btn');
-  if (item.status === 'in_progress') {
-    finalizeBtn.classList.remove('hidden');
-  } else {
-    finalizeBtn.classList.add('hidden');
+  if (finalizeBtn) {
+    if (item.status === 'in_progress') {
+      finalizeBtn.classList.remove('hidden');
+    } else {
+      finalizeBtn.classList.add('hidden');
+    }
   }
 
   // Reset tabs UI
@@ -1327,6 +2736,36 @@ async function openItemDetail(type, number) {
 
   // Show modal
   document.getElementById('item-detail-modal').classList.remove('hidden');
+
+  // Check if there's an existing tmux session for this item
+  const sessionKey = `${type}-${number}`;
+  const workOnBtn = document.querySelector('#item-detail-modal button[onclick="openPlanningFromModal()"]');
+
+  if (workOnBtn) {
+    // Check localStorage for saved session
+    const savedSessions = loadSessionsFromStorage();
+    const hasSavedSession = savedSessions[sessionKey]?.tmuxSession;
+
+    // Also check persisted tmux sessions
+    try {
+      const persistedRes = await fetch(`${API_BASE}/terminals/persisted`);
+      const persistedData = await persistedRes.json();
+      const hasTmuxSession = persistedData.available &&
+        persistedData.sessions.some(s => s.name === sessionKey);
+
+      if (hasSavedSession || hasTmuxSession) {
+        workOnBtn.innerHTML = '▶ Resume Session';
+        workOnBtn.dataset.hasSession = 'true';
+      } else {
+        workOnBtn.innerHTML = '🔧 Work on This';
+        workOnBtn.dataset.hasSession = 'false';
+      }
+    } catch (err) {
+      // Default to work on this if check fails
+      workOnBtn.innerHTML = '🔧 Work on This';
+      workOnBtn.dataset.hasSession = 'false';
+    }
+  }
 }
 
 function setDetailTab(tab) {
@@ -1349,7 +2788,7 @@ function hideItemDetailModal() {
   currentDetailItem = null;
 }
 
-function openPlanningFromModal() {
+async function openPlanningFromModal() {
   console.log('openPlanningFromModal called, currentDetailItem:', currentDetailItem);
   if (!currentDetailItem) {
     alert('No item selected. Please click on an item first.');
@@ -1357,11 +2796,27 @@ function openPlanningFromModal() {
   }
 
   const { type, number, item } = currentDetailItem;
+  const sessionKey = `${type}-${number}`;
 
   // Check if item already has a worktree - if so, go straight to planning view
   const existingWorktree = findItemWorktree(type, number);
   if (existingWorktree) {
     console.log('Item has existing worktree, opening planning view directly');
+    hideItemDetailModal();
+    openPlanningView(type, number);
+    return;
+  }
+
+  // Check if there's an existing tmux session for this item (from localStorage or persisted)
+  const workOnBtn = document.querySelector('#item-detail-modal button[onclick="openPlanningFromModal()"]');
+  const hasSession = workOnBtn?.dataset.hasSession === 'true';
+
+  // Also check localStorage directly
+  const savedSessions = loadSessionsFromStorage();
+  const hasSavedSession = savedSessions[sessionKey]?.tmuxSession;
+
+  if (hasSession || hasSavedSession) {
+    console.log(`Found existing session for ${sessionKey}, resuming directly`);
     hideItemDetailModal();
     openPlanningView(type, number);
     return;
@@ -1430,6 +2885,175 @@ function hideWorkModeModal() {
   document.getElementById('work-mode-modal').classList.add('hidden');
 }
 
+// ==================== WORKTREE PROGRESS MODAL ====================
+
+let worktreeProgressState = {
+  type: null,
+  number: null,
+  branchName: null,
+  installDeps: true,
+  aborted: false,
+};
+
+function showWorktreeProgressModal(type, number, branchName) {
+  const modal = document.getElementById('worktree-progress-modal');
+  const ref = `${type}-${number}`;
+
+  // Store state for retry
+  worktreeProgressState = {
+    type,
+    number,
+    branchName,
+    installDeps: document.getElementById('worktree-install-deps')?.checked ?? true,
+    aborted: false,
+  };
+
+  // Set item reference
+  document.getElementById('progress-item-ref').textContent = ref;
+
+  // Reset all steps to pending
+  const steps = ['create', 'checkout', 'setup', 'deps', 'ready'];
+  steps.forEach(step => {
+    updateProgressStep(step, 'pending', 'Waiting...');
+  });
+
+  // Hide result/error sections
+  document.getElementById('progress-result').classList.add('hidden');
+  document.getElementById('progress-error').classList.add('hidden');
+
+  // Show cancel button, hide continue/retry buttons
+  document.getElementById('progress-cancel-btn').classList.remove('hidden');
+  document.getElementById('progress-continue-btn').classList.add('hidden');
+  document.getElementById('progress-retry-btn').classList.add('hidden');
+
+  // Show modal
+  modal.classList.remove('hidden');
+}
+
+function hideWorktreeProgressModal() {
+  document.getElementById('worktree-progress-modal').classList.add('hidden');
+  worktreeProgressState.aborted = true;
+}
+
+function updateProgressStep(stepName, status, message) {
+  const stepEl = document.querySelector(`.progress-step[data-step="${stepName}"]`);
+  if (!stepEl) return;
+
+  const pendingEl = stepEl.querySelector('.step-pending');
+  const activeEl = stepEl.querySelector('.step-active');
+  const doneEl = stepEl.querySelector('.step-done');
+  const errorEl = stepEl.querySelector('.step-error');
+  const statusEl = stepEl.querySelector('.step-status');
+
+  // Hide all icons first
+  pendingEl?.classList.add('hidden');
+  activeEl?.classList.add('hidden');
+  doneEl?.classList.add('hidden');
+  errorEl?.classList.add('hidden');
+
+  // Show appropriate icon
+  switch (status) {
+    case 'pending':
+      pendingEl?.classList.remove('hidden');
+      break;
+    case 'active':
+      activeEl?.classList.remove('hidden');
+      break;
+    case 'done':
+      doneEl?.classList.remove('hidden');
+      break;
+    case 'error':
+      errorEl?.classList.remove('hidden');
+      break;
+    case 'skipped':
+      pendingEl?.classList.remove('hidden');
+      break;
+  }
+
+  // Update status message
+  if (statusEl && message) {
+    statusEl.textContent = message;
+    if (status === 'done') {
+      statusEl.classList.add('text-green-400');
+      statusEl.classList.remove('text-red-400', 'text-spellbook-muted');
+    } else if (status === 'error') {
+      statusEl.classList.add('text-red-400');
+      statusEl.classList.remove('text-green-400', 'text-spellbook-muted');
+    } else {
+      statusEl.classList.add('text-spellbook-muted');
+      statusEl.classList.remove('text-green-400', 'text-red-400');
+    }
+  }
+}
+
+function showProgressSuccess(worktreeData) {
+  const resultEl = document.getElementById('progress-result');
+  const contentEl = document.getElementById('progress-result-content');
+
+  const parts = [
+    `<div class="text-green-400 font-medium mb-2">✓ Worktree created successfully!</div>`,
+    `<div class="text-sm space-y-1">`,
+    `<div><span class="text-spellbook-muted">Branch:</span> <span class="font-mono">${worktreeData.branch}</span></div>`,
+    `<div><span class="text-spellbook-muted">Path:</span> <span class="font-mono text-xs">${worktreeData.path}</span></div>`,
+  ];
+
+  if (worktreeData.ports?.length > 0) {
+    parts.push(`<div><span class="text-spellbook-muted">Ports:</span> ${worktreeData.ports.join(', ')}</div>`);
+  }
+
+  parts.push('</div>');
+
+  contentEl.innerHTML = parts.join('');
+  resultEl.classList.remove('hidden');
+  resultEl.classList.add('bg-green-500/10', 'border', 'border-green-500/30');
+
+  // Show continue button, hide cancel
+  document.getElementById('progress-cancel-btn').classList.add('hidden');
+  document.getElementById('progress-continue-btn').classList.remove('hidden');
+}
+
+function showProgressError(errorMessage) {
+  const errorEl = document.getElementById('progress-error');
+  document.getElementById('progress-error-message').textContent = errorMessage;
+  errorEl.classList.remove('hidden');
+
+  // Show retry button, keep cancel
+  document.getElementById('progress-retry-btn').classList.remove('hidden');
+}
+
+function cancelWorktreeProgress() {
+  worktreeProgressState.aborted = true;
+  hideWorktreeProgressModal();
+}
+
+function continueFromProgress() {
+  const { type, number } = worktreeProgressState;
+  hideWorktreeProgressModal();
+  if (type && number) {
+    openPlanningView(type, number);
+  }
+}
+
+async function retryWorktreeCreation() {
+  const { type, number, branchName, installDeps } = worktreeProgressState;
+
+  // Reset steps
+  const steps = ['create', 'checkout', 'setup', 'deps', 'ready'];
+  steps.forEach(step => {
+    updateProgressStep(step, 'pending', 'Waiting...');
+  });
+
+  // Hide error/result
+  document.getElementById('progress-result').classList.add('hidden');
+  document.getElementById('progress-error').classList.add('hidden');
+  document.getElementById('progress-retry-btn').classList.add('hidden');
+
+  worktreeProgressState.aborted = false;
+
+  // Retry creation
+  await createWorktreeAndOpenPlanning(type, number, branchName, { installDeps, showProgress: false });
+}
+
 async function submitWorkMode() {
   const modal = document.getElementById('work-mode-modal');
   const type = modal.dataset.itemType;
@@ -1445,54 +3069,166 @@ async function submitWorkMode() {
   hideItemDetailModal();
 
   if (selectedMode === 'worktree') {
-    // Create worktree first, then open planning view
+    // Get worktree options
     const branchName = document.getElementById('worktree-branch-name').value;
-    await createWorktreeAndOpenPlanning(type, number, branchName);
+    const installDeps = document.getElementById('worktree-install-deps')?.checked ?? true;
+
+    // Show progress modal
+    showWorktreeProgressModal(type, number, branchName);
+
+    // Create worktree with full setup (opens in built-in web terminal, not external)
+    await createWorktreeAndOpenPlanning(type, number, branchName, { installDeps });
   } else {
     // Open planning view directly (work on develop)
     openPlanningView(type, number);
   }
 }
 
-async function createWorktreeAndOpenPlanning(type, number, branchName) {
+async function createWorktreeAndOpenPlanning(type, number, branchName, options = {}) {
+  const { installDeps = true } = options;
+  // Never launch external terminal - we'll open in the built-in web terminal via openPlanningView
+  const launchTerminal = false;
   const ref = `${type}-${number}`;
+
+  // Get task description from the item
+  let item;
+  if (type === 'bug') item = state.bugs.find(b => b.number === number);
+  else if (type === 'improvement') item = state.improvements.find(i => i.number === number);
+  else if (type === 'feature') item = state.features.find(f => f.number === number);
+
+  const task = item?.title || item?.name || '';
 
   updateActivity(`Creating worktree for ${ref}...`);
 
+  // Update progress: start creating
+  updateProgressStep('create', 'active', 'Creating worktree directory...');
+
   try {
-    // Call the Spellbook CLI to create worktree
+    // Simulate progress steps while API call runs
+    const progressTimer = setTimeout(() => {
+      if (!worktreeProgressState.aborted) {
+        updateProgressStep('create', 'done', 'Directory created');
+        updateProgressStep('checkout', 'active', `Checking out ${branchName}...`);
+      }
+    }, 500);
+
+    const progressTimer2 = setTimeout(() => {
+      if (!worktreeProgressState.aborted) {
+        updateProgressStep('checkout', 'done', 'Branch checked out');
+        updateProgressStep('setup', 'active', 'Copying .env files, symlinking docs...');
+      }
+    }, 1500);
+
+    const progressTimer3 = setTimeout(() => {
+      if (!worktreeProgressState.aborted && installDeps) {
+        updateProgressStep('setup', 'done', 'Environment configured');
+        updateProgressStep('deps', 'active', 'Running npm install...');
+      }
+    }, 2500);
+
+    // Call the enhanced worktree create API
     const res = await fetch(`${API_BASE}/worktree/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         itemRef: ref,
         branchName: branchName,
+        task: task,
+        installDeps: installDeps,
+        launchTerminal: launchTerminal,
       }),
     });
 
+    // Clear progress timers
+    clearTimeout(progressTimer);
+    clearTimeout(progressTimer2);
+    clearTimeout(progressTimer3);
+
+    if (worktreeProgressState.aborted) {
+      return;
+    }
+
     if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Failed to create worktree: ${errText}`);
+      const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(errData.error || errData.message || 'Failed to create worktree');
     }
 
     const worktreeData = await res.json();
     console.log('Worktree created:', worktreeData);
 
+    // Update progress steps based on actual results
+    updateProgressStep('create', 'done', `Created at ${worktreeData.path.split('/').slice(-2).join('/')}`);
+    updateProgressStep('checkout', 'done', `Branch: ${worktreeData.branch}`);
+
+    if (worktreeData.setup?.knowledgeSymlinked || worktreeData.setup?.envCopied) {
+      updateProgressStep('setup', 'done', 'Environment configured');
+    } else {
+      updateProgressStep('setup', 'done', 'Basic setup complete');
+    }
+
+    if (installDeps) {
+      if (worktreeData.dependencies?.installed) {
+        updateProgressStep('deps', 'done', 'Dependencies installed');
+      } else if (worktreeData.dependencies?.error) {
+        updateProgressStep('deps', 'error', 'Failed - install manually');
+      } else {
+        updateProgressStep('deps', 'done', 'Dependencies ready');
+      }
+    } else {
+      updateProgressStep('deps', 'skipped', 'Skipped (manual install)');
+    }
+
+    updateProgressStep('ready', 'done', 'Ready to work!');
+
+    // Build status message for activity feed
+    const statusParts = [`Worktree created at ${worktreeData.path}`];
+
+    if (worktreeData.ports?.length > 0) {
+      statusParts.push(`Ports: ${worktreeData.ports.join(', ')}`);
+    }
+
+    if (worktreeData.setup?.knowledgeSymlinked) {
+      statusParts.push('docs/knowledge symlinked');
+    }
+
+    if (worktreeData.dependencies?.installed) {
+      statusParts.push('Dependencies installed');
+    } else if (worktreeData.dependencies?.error) {
+      statusParts.push('Deps failed - install manually');
+    }
+
+    updateActivity(statusParts.join(' | '));
+
     // Refresh worktrees list
     await loadWorktrees();
 
-    updateActivity(`Worktree created for ${ref}`);
+    // Update item status to in_progress
+    try {
+      const endpoint = type === 'bug' ? 'bugs' : type === 'improvement' ? 'improvements' : 'features';
+      await fetch(`${API_BASE}/${endpoint}/${number}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'in_progress' }),
+      });
+      await fetchData();
+      renderKanban();
+    } catch (statusErr) {
+      console.warn('Could not update item status:', statusErr);
+    }
 
-    // Now open planning view - it will detect the new worktree
-    openPlanningView(type, number);
+    // Show success in progress modal
+    showProgressSuccess(worktreeData);
+
+    console.log(`Worktree created for ${ref}\nBranch: ${worktreeData.branch}\nPath: ${worktreeData.path}`);
 
   } catch (err) {
     console.error('Failed to create worktree:', err);
 
-    // Fallback: Try using spellbook CLI command through a temporary terminal
-    // For now, just show error and open planning view in main directory
-    alert(`Could not create worktree automatically: ${err.message}\n\nOpening in main project directory instead. You can create a worktree manually using: spellbook worktree create ${ref}`);
-    openPlanningView(type, number);
+    // Update progress to show error
+    updateProgressStep('create', 'error', 'Failed');
+    showProgressError(err.message);
+
+    updateActivity(`Failed to create worktree: ${err.message}`);
   }
 }
 
@@ -1509,7 +3245,7 @@ async function quickFinalize() {
   try {
     const endpoint = type === 'bug' ? 'bugs' : type === 'improvement' ? 'improvements' : 'features';
 
-    console.log(`Updating ${endpoint}/${number} to status: ${newStatus}`);
+    debugLog(`Updating ${endpoint}/${number} to status: ${newStatus}`);
 
     const res = await fetch(`${API_BASE}/${endpoint}/${number}`, {
       method: 'PATCH',
@@ -1556,7 +3292,7 @@ function openDocInEditor() {
   }
 }
 
-// ==================== PLANNING VIEW ====================
+// ==================== PLANNING VIEW (Simplified - No Browser Terminal) ====================
 
 async function openPlanningView(type, number) {
   const sessionKey = `${type}-${number}`;
@@ -1577,68 +3313,48 @@ async function openPlanningView(type, number) {
   document.getElementById('planning-item-title').textContent = item.title || item.name || 'Untitled';
   document.getElementById('planning-working-ref').textContent = sessionKey;
 
-  // Check for linked worktree and fetch branch from appropriate path
-  const linkedWorktree = findItemWorktree(type, number);
-  const branchPath = linkedWorktree?.path || state.project?.path;
-
-  try {
-    const branchRes = await fetch(`${API_BASE}/git/branch?path=${encodeURIComponent(branchPath)}`);
-    const branchData = await branchRes.json();
-    const terminalBranchEl = document.getElementById('terminal-branch');
-    if (terminalBranchEl) {
-      const branchLabel = linkedWorktree
-        ? `🌲 ${branchData.branch}`
-        : `branch: ${branchData.branch}`;
-      terminalBranchEl.textContent = branchLabel;
-    }
-  } catch (err) {
-    console.error('Failed to fetch branch:', err);
-    const terminalBranchEl = document.getElementById('terminal-branch');
-    if (terminalBranchEl) {
-      terminalBranchEl.textContent = 'branch: unknown';
-    }
-  }
-
   // Update status badge
   const statusBadge = document.getElementById('planning-status-badge');
   const statusColors = {
     active: 'bg-gray-500/20 text-gray-400',
-    planning: 'bg-blue-500/20 text-blue-400',
+    spec_draft: 'bg-gray-500/20 text-gray-400',
+    spec_ready: 'bg-blue-500/20 text-blue-400',
     in_progress: 'bg-yellow-500/20 text-yellow-400',
+    pr_open: 'bg-purple-500/20 text-purple-400',
     resolved: 'bg-green-500/20 text-green-400',
     completed: 'bg-green-500/20 text-green-400',
   };
   statusBadge.className = `px-2 py-1 text-xs rounded ${statusColors[item.status] || statusColors.active}`;
-  statusBadge.textContent = item.status.replace('_', ' ');
+  statusBadge.textContent = (item.status || 'active').replace('_', ' ');
 
-  // Load plan file first (needed for terminal context)
-  const planData = await loadPlanFile(type, number);
-
-  // Create or resume session
+  // Store active session info (for "Open in iTerm" button)
+  sessions.activePlanningSession = sessionKey;
   if (!sessions.planning[sessionKey]) {
-    await createPlanningSession(sessionKey, type, number, item, planData);
-  } else {
-    // Update plan data and item status in session
-    sessions.planning[sessionKey].planContent = planData.content;
-    sessions.planning[sessionKey].planExists = planData.exists;
-    sessions.planning[sessionKey].itemStatus = item.status; // Update item status
-    // Reconnect existing terminal
-    await connectTerminal(sessionKey, document.getElementById('planning-terminal'));
+    sessions.planning[sessionKey] = {
+      itemType: type,
+      itemNumber: number,
+      status: 'viewing',
+    };
   }
 
-  sessions.activePlanningSession = sessionKey;
+  // Check for linked worktree
+  const linkedWorktree = findItemWorktree(type, number);
+  sessions.planning[sessionKey].worktreePath = linkedWorktree?.path || state.project?.path;
 
-  // Load document
-  await loadPlanningDocument(sessionKey, type, number);
+  // Load plan file
+  const planData = await loadPlanFile(type, number);
 
   // Update plan indicator
   updatePlanIndicator(planData.exists);
 
-  // Update action button based on item status
-  updateActionButton(item.status);
+  // Load document
+  await loadPlanningDocument(sessionKey, type, number);
 
   // Update worktree indicator
   updateWorktreeIndicator(type, number);
+
+  // Update action button based on item status
+  updateActionButton(item.status);
 
   // Show planning view
   document.getElementById('planning-view').classList.remove('hidden');
@@ -1646,17 +3362,21 @@ async function openPlanningView(type, number) {
   // Start document refresh
   startDocumentRefresh(sessionKey, type, number);
 
-  // Fit terminal
-  setTimeout(() => {
-    const session = sessions.planning[sessionKey];
-    if (session?.fitAddon) {
-      session.fitAddon.fit();
-    }
-  }, 100);
+  // Update workflow phase badge
+  const itemStatus = item?.status || 'active';
+  let initialPhase;
+  switch (itemStatus) {
+    case 'in_progress': initialPhase = 'implementing'; break;
+    case 'pr_open': initialPhase = 'review'; break;
+    case 'resolved':
+    case 'completed': initialPhase = 'complete'; break;
+    default: initialPhase = 'planning';
+  }
+  updateWorkflowPhaseBadge(initialPhase);
 
-  renderSessionPills();
-  updateActivity(`Planning ${sessionKey}`);
+  updateActivity(`Viewing ${sessionKey}`);
 }
+
 
 // Load plan file for an item
 async function loadPlanFile(type, number) {
@@ -1706,21 +3426,83 @@ async function createPlanningSession(sessionKey, type, number, item, planData) {
     // Check if there's a worktree linked to this item
     const linkedWorktree = findItemWorktree(type, number);
     const workingDir = linkedWorktree?.path || state.project?.path;
+
+    // FIRST: Check if a tmux session already exists for this item
+    // This handles the case where item is in_progress and Claude is already running
+    const persistedRes = await fetch(`${API_BASE}/terminals/persisted`);
+    const persistedData = await persistedRes.json();
+    const existingSession = persistedData.available &&
+      persistedData.sessions.find(s => s.name === sessionKey);
+
+    if (existingSession) {
+      debugLog(`[Planning] Found existing tmux session for ${sessionKey}, reconnecting...`);
+
+      // Reconnect to existing session instead of creating new
+      const reconnectRes = await fetch(`${API_BASE}/terminals/reconnect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionName: sessionKey,
+          cwd: workingDir,
+        }),
+      });
+
+      if (reconnectRes.ok) {
+        const reconnectData = await reconnectRes.json();
+
+        sessions.planning[sessionKey] = {
+          terminalId: reconnectData.terminalId,
+          term: null,
+          ws: null,
+          fitAddon: null,
+          itemType: type,
+          itemNumber: number,
+          docPath: item.doc_path,
+          planContent: planData.content,
+          planExists: planData.exists,
+          planTemplate: planData.template,
+          status: 'active',
+          itemStatus: item.status,
+          lastActivity: new Date(),
+          worktree: linkedWorktree,
+          workingDir: workingDir,
+          tmuxSession: sessionKey,
+          reconnected: true, // Flag to indicate this was a reconnection
+        };
+
+        saveSessionsToStorage();
+        await connectTerminal(sessionKey, document.getElementById('planning-terminal'));
+
+        // Don't send /rename or initial prompt - session is already running
+        updateActivity(`Reconnected to existing session: ${sessionKey}`);
+        return;
+      }
+      // If reconnect failed, fall through to create new session
+      debugLog(`[Planning] Reconnect failed, creating new session for ${sessionKey}`);
+    }
     const worktreeInfo = linkedWorktree
       ? `\nWorktree: ${linkedWorktree.path} (branch: ${linkedWorktree.branch})`
       : '';
 
-    // Build initial prompt based on whether plan exists
+    // Build initial prompt based on ITEM STATUS (not just plan existence)
     let initialPrompt;
-    if (planData.exists && planData.content) {
-      // Extract "How to Continue" section if present
+    const itemStatus = item.status || 'active';
+
+    if (itemStatus === 'in_progress') {
+      // Item is in_progress (plan approved) - trigger /implement
+      initialPrompt = `/implement ${sessionKey}`;
+    } else if (itemStatus === 'pr_open') {
+      // PR is open - give context about review
+      initialPrompt = `Working on ${sessionKey}. PR is open and awaiting review/merge.\n\nMain doc: ${centralPath}${worktreeInfo}`;
+    } else if (planData.exists && planData.content) {
+      // Has plan but not in_progress - give context
       const howToContinue = extractHowToContinue(planData.content);
       initialPrompt = howToContinue
         ? `Working on ${sessionKey}. ${howToContinue}\n\nMain doc: ${centralPath}\nPlan file: ${planPath}${worktreeInfo}`
         : `Working on ${sessionKey}. Plan file exists at ${planPath} - read it first. Main doc at ${centralPath}${worktreeInfo}`;
     } else {
-      // No plan - prompt to create one with file locations
-      initialPrompt = `You're working on ${sessionKey}: "${item.title || item.name}".\n\nMain document: ${centralPath}${worktreeInfo}\n\nNo implementation plan exists yet. Please:\n1. Read the main document at ${centralPath}\n2. Enter plan mode to create a comprehensive implementation plan\n3. When done, I'll save your plan to ${planPath}`;
+      // No plan and status is active/spec_draft/spec_ready - trigger /plan skill
+      initialPrompt = `/plan ${sessionKey}`;
     }
 
     // Use worktree path if linked, otherwise main project path
@@ -1732,6 +3514,8 @@ async function createPlanningSession(sessionKey, type, number, item, planData) {
         name: sessionKey,
         command: 'claude',
         args: ['--dangerously-skip-permissions'],
+        useTmux: true,
+        tmuxSessionName: sessionKey,
       }),
     });
 
@@ -1755,7 +3539,11 @@ async function createPlanningSession(sessionKey, type, number, item, planData) {
       lastActivity: new Date(),
       worktree: linkedWorktree, // Store linked worktree info
       workingDir: workingDir, // Store the actual working directory
+      tmuxSession: data.tmuxSession, // Store tmux session name
     };
+
+    // Save session for persistence
+    saveSessionsToStorage();
 
     await connectTerminal(sessionKey, document.getElementById('planning-terminal'));
 
@@ -1782,12 +3570,13 @@ async function createPlanningSession(sessionKey, type, number, item, planData) {
             if (msg.type === 'output' && msg.data && msg.data.includes('Session renamed to:')) {
               renameConfirmed = true;
               session.ws.removeEventListener('message', checkRename);
-              // Wait a bit, then send context prompt
+              // Wait longer for Claude to be ready after rename, then send prompt
               setTimeout(() => {
                 if (session?.ws?.readyState === WebSocket.OPEN) {
+                  console.log(`[Spellbook] Rename confirmed, sending initial prompt: ${initialPrompt.substring(0, 50)}...`);
                   sendCommand(initialPrompt);
                 }
-              }, 1000);
+              }, 2000); // Increased from 1000ms to 2000ms
             }
           } catch (e) {
             // Ignore parse errors
@@ -1796,17 +3585,19 @@ async function createPlanningSession(sessionKey, type, number, item, planData) {
         session.ws.addEventListener('message', checkRename);
 
         // Send rename command (text + Enter separately)
+        console.log(`[Spellbook] Sending rename command: /rename ${sessionKey}`);
         sendCommand(`/rename ${sessionKey}`);
 
-        // Fallback: if rename confirmation not received in 10 seconds, send anyway
+        // Fallback: if rename confirmation not received in 15 seconds, send anyway
         setTimeout(() => {
           if (!renameConfirmed) {
+            console.log(`[Spellbook] Rename confirmation timeout, sending prompt anyway`);
             session.ws.removeEventListener('message', checkRename);
             if (session?.ws?.readyState === WebSocket.OPEN) {
               sendCommand(initialPrompt);
             }
           }
-        }, 10000);
+        }, 15000); // Increased from 10000ms to 15000ms
       }
     }, 2000); // Wait for Claude to initialize
 
@@ -1869,12 +3660,13 @@ function startDocumentRefresh(sessionKey, type, number) {
     clearInterval(docRefreshInterval);
   }
 
-  // Refresh every 3 seconds
+  // Refresh at configured interval (pauses when tab is hidden)
   docRefreshInterval = setInterval(async () => {
+    if (!isPageVisible) return; // Skip refresh when tab is hidden
     if (sessions.activePlanningSession === sessionKey) {
       await loadPlanningDocument(sessionKey, type, number);
     }
-  }, 3000);
+  }, PERF_CONFIG.DOC_REFRESH_INTERVAL);
 }
 
 function stopDocumentRefresh() {
@@ -1924,15 +3716,13 @@ function setPlanningDocTab(tab) {
     } else if (session?.planTemplate) {
       contentEl.innerHTML = `
         <div class="plan-editor">
-          <div class="flex justify-between items-center mb-4">
-            <span class="text-yellow-400 text-sm">⚠ No plan yet - create one below</span>
-            <button onclick="createPlanFromTemplate()" class="px-3 py-1 bg-spellbook-accent/20 text-spellbook-accent rounded text-sm hover:bg-spellbook-accent/30">
-              Create Plan
-            </button>
-          </div>
-          <div class="plan-template text-spellbook-muted">
-            <p class="mb-2">Click "Create Plan" to start with this template:</p>
-            <pre class="bg-spellbook-card p-4 rounded text-xs overflow-auto max-h-96">${escapeHtml(session.planTemplate)}</pre>
+          <div class="mb-4">
+            <p class="text-spellbook-muted text-sm mb-2">
+              📋 The plan will be saved here automatically when Claude starts implementing.
+            </p>
+            <p class="text-spellbook-muted text-xs">
+              Claude creates the plan in plan mode → You approve → Claude saves it here and implements.
+            </p>
           </div>
         </div>
       `;
@@ -2141,7 +3931,11 @@ async function loadFilesChangedTree(contentEl) {
   contentEl.innerHTML = '<div class="text-center py-8 text-spellbook-muted">Loading changed files...</div>';
 
   try {
-    const res = await fetch(`${API_BASE}/git/diff`);
+    // Get worktree path from active planning session (if linked to a worktree)
+    const session = sessions.planning[sessions.activePlanningSession];
+    const targetPath = session?.worktree?.path || session?.workingDir || '';
+    const pathParam = targetPath ? `?path=${encodeURIComponent(targetPath)}` : '';
+    const res = await fetch(`${API_BASE}/git/diff${pathParam}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
@@ -2163,8 +3957,18 @@ async function loadFilesChangedTree(contentEl) {
     // Build and render tree
     const tree = buildFileTree(data.files);
 
+    // Build path indicator showing which directory we're viewing
+    const isWorktree = session?.worktree?.path;
+    const displayPath = isWorktree
+      ? session.worktree.path.replace(/^\/Users\/[^/]+/, '~')
+      : (session?.workingDir || state.project?.path || 'project').replace(/^\/Users\/[^/]+/, '~');
+    const pathIndicator = isWorktree
+      ? `<div class="text-xs text-spellbook-muted mb-2 flex items-center gap-1"><span class="text-green-400">worktree:</span> ${escapeHtml(displayPath)}</div>`
+      : `<div class="text-xs text-spellbook-muted mb-2">${escapeHtml(displayPath)}</div>`;
+
     contentEl.innerHTML = `
       <div class="files-changed-tree">
+        ${pathIndicator}
         <div class="flex items-center justify-between mb-4 pb-3 border-b border-spellbook-border">
           <div class="text-sm">
             <span class="font-semibold">${data.summary?.filesChanged || data.files.length}</span> files changed
@@ -2224,7 +4028,11 @@ async function showFileDiff(filePath) {
   contentEl.innerHTML = '<div class="text-center py-8 text-spellbook-muted">Loading diff...</div>';
 
   try {
-    const res = await fetch(`${API_BASE}/git/diff/file?file=${encodeURIComponent(filePath)}`);
+    // Get worktree path from active planning session (if linked to a worktree)
+    const session = sessions.planning[sessions.activePlanningSession];
+    const targetPath = session?.worktree?.path || session?.workingDir || '';
+    const pathParam = targetPath ? `&path=${encodeURIComponent(targetPath)}` : '';
+    const res = await fetch(`${API_BASE}/git/diff/file?file=${encodeURIComponent(filePath)}${pathParam}`);
     const data = await res.json();
 
     if (!data.diff) {
@@ -2278,119 +4086,181 @@ function renderDiff(diff) {
   }).join('\n');
 }
 
+// ==================== iTERM INTEGRATION ====================
+
+/**
+ * Open or focus iTerm tab for current planning session
+ */
+async function openInIterm() {
+  const sessionKey = sessions.activePlanningSession;
+  if (!sessionKey) {
+    showToast('error', 'No active session');
+    return;
+  }
+
+  const session = sessions.planning[sessionKey];
+  const worktreePath = session?.worktreePath || state.projectPath;
+
+  try {
+    const res = await fetch(`${API_BASE}/iterm/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionName: sessionKey,
+        workingDir: worktreePath,
+        command: 'claude --dangerously-skip-permissions',
+      }),
+    });
+
+    const result = await res.json();
+
+    if (result.success) {
+      if (result.focused) {
+        showToast('success', `Focused existing iTerm tab: ${sessionKey}`);
+      } else {
+        showToast('success', `Opened new iTerm tab: ${sessionKey}`);
+      }
+    } else {
+      showToast('error', result.error || 'Failed to open iTerm');
+    }
+  } catch (err) {
+    console.error('Failed to open iTerm:', err);
+    showToast('error', `Failed to open iTerm: ${err.message}`);
+  }
+}
+
 function minimizePlanningView() {
+  const sessionKey = sessions.activePlanningSession;
+
   // Hide planning view but keep session running
   document.getElementById('planning-view').classList.add('hidden');
   stopDocumentRefresh();
 
-  // Update session status
-  const session = sessions.planning[sessions.activePlanningSession];
+  // Update session status and clean up terminal display resources (not the session itself)
+  const session = sessions.planning[sessionKey];
   if (session) {
     session.status = 'minimized';
+    session.minimizedAt = Date.now();
+
+    // Note: We don't dispose the terminal or close WebSocket here
+    // The session stays connected in the background
+    // We do clean up resize observers since the container will be hidden
+    if (session.resizeObserver) {
+      session.resizeObserver.disconnect();
+      session.resizeObserver = null;
+    }
+    if (session.handleWindowResize) {
+      window.removeEventListener('resize', session.handleWindowResize);
+      session.handleWindowResize = null;
+    }
   }
 
   sessions.activePlanningSession = null;
-  renderSessionPills();
-  updateActivity('Session minimized - click session pill to resume');
+
+  // Save session state to localStorage for persistence across page refreshes
+  saveSessionsToStorage();
+
+  // Note: Session pills now reflect iTerm sessions, not browser state
+  updateActivity(`Session ${sessionKey} minimized`);
 }
 
+// Flag to prevent multiple concurrent close attempts
+let _closingPlanningView = false;
+
 async function closePlanningView() {
+  // Prevent multiple concurrent close attempts
+  if (_closingPlanningView) {
+    console.log('[Spellbook] closePlanningView already in progress, ignoring');
+    return;
+  }
+  _closingPlanningView = true;
+
   console.log('[Spellbook] closePlanningView called');
   const sessionKey = sessions.activePlanningSession;
-  console.log('[Spellbook] sessionKey:', sessionKey);
 
   if (!sessionKey) {
     console.log('[Spellbook] No active session, just hiding view');
     document.getElementById('planning-view').classList.add('hidden');
+    _closingPlanningView = false;
     return;
   }
 
-  // Use a custom modal instead of browser confirm() to avoid potential blocking issues
-  // For now, always confirm (user can use Minimize if they want to keep session)
-  const confirmed = window.confirm(`Close planning session for ${sessionKey}? The terminal will be terminated.`);
-  console.log('[Spellbook] User confirmed:', confirmed);
-  if (!confirmed) {
-    return;
-  }
-
-  // Close terminal
-  const session = sessions.planning[sessionKey];
-  if (session?.terminalId) {
-    try {
-      console.log(`[Spellbook] Sending DELETE request for terminal ${session.terminalId}`);
-      const res = await fetch(`${API_BASE}/terminals/${session.terminalId}`, { method: 'DELETE' });
-      const result = await res.json();
-      console.log('[Spellbook] Terminal close result:', result);
-    } catch (err) {
-      console.error('Failed to close terminal:', err);
-    }
-  } else {
-    console.log('[Spellbook] No terminal ID to close');
-  }
-
-  // Clean up
-  if (session?.ws) session.ws.close();
-  if (session?.term) session.term.dispose();
-
+  // Remove from sessions
   delete sessions.planning[sessionKey];
   sessions.activePlanningSession = null;
 
-  // Hide view
+  // Update session storage
+  saveSessionsToStorage();
+
+  // Hide view and stop polling
   document.getElementById('planning-view').classList.add('hidden');
   stopDocumentRefresh();
-  renderSessionPills();
-  updateActivity('Session closed');
+  stopWorkflowStatePolling();
+  clearWorkflowState();
+
+  updateActivity(`Session ${sessionKey} closed`);
+  showToast('success', `Session ${sessionKey} closed`);
+  console.log('[Spellbook] closePlanningView completed');
+
+  // Reset closing flag
+  _closingPlanningView = false;
 }
 
-function resumePlanningSession(sessionKey) {
+async function resumePlanningSession(sessionKey) {
   const session = sessions.planning[sessionKey];
   if (!session) return;
 
-  openPlanningView(session.itemType, session.itemNumber);
+  // Update session status before opening
+  session.status = 'active';
+
+  // Open the view (will show documentation)
+  await openPlanningView(session.itemType, session.itemNumber);
 }
 
-// ==================== FINALIZE & START IMPLEMENTATION ====================
+// ==================== TRIGGER SKILLS ====================
 
+/**
+ * Trigger /implement skill - copies command to clipboard and opens iTerm
+ * User runs the command in their iTerm session
+ */
+async function triggerImplementSkill() {
+  debugLog('[Spellbook] triggerImplementSkill clicked');
+
+  const sessionKey = sessions.activePlanningSession;
+  const session = sessions.planning[sessionKey];
+
+  if (!session) {
+    showToast('error', 'No active planning session');
+    return;
+  }
+
+  const implementCmd = `/implement ${sessionKey}`;
+
+  // Copy command to clipboard
+  try {
+    await navigator.clipboard.writeText(implementCmd);
+    showToast('success', `Copied to clipboard: ${implementCmd}`);
+  } catch (err) {
+    console.error('Failed to copy:', err);
+  }
+
+  // Open iTerm to the session
+  await openInIterm();
+
+  updateActivity(`Ready to implement ${sessionKey} - command copied to clipboard`);
+}
+
+// Legacy finalize planning - kept for backwards compatibility
 // Store plan content globally to avoid escaping issues in template literals
 let pendingPlanContent = null;
 
 async function finalizePlanning() {
-  console.log('[Spellbook] finalizePlanning clicked');
-
-  const session = sessions.planning[sessions.activePlanningSession];
-  if (!session) {
-    alert('No active planning session');
-    return;
-  }
-
-  updateActivity('Fetching Claude\'s plan...');
-
-  try {
-    // Fetch Claude's current plan from ~/.claude/plans/
-    console.log('[Spellbook] Fetching from /api/claude-plan');
-    const res = await fetch(`${API_BASE}/claude-plan`);
-    const planData = await res.json();
-    console.log('[Spellbook] Plan data:', planData.exists, planData.filename);
-
-    if (!planData.exists || !planData.content) {
-      alert('No plan found. Make sure Claude has created a plan in plan mode (look for the plan file path at the bottom of the terminal).');
-      return;
-    }
-
-    // Store content globally
-    pendingPlanContent = planData.content;
-
-    // Show confirmation modal with the plan content
-    showFinalizePlanModal(planData);
-
-  } catch (err) {
-    console.error('[Spellbook] Failed to fetch plan:', err);
-    alert('Failed to fetch plan: ' + err.message);
-  }
+  // Redirect to the new implementation trigger
+  triggerImplementSkill();
 }
 
 function showFinalizePlanModal(planData) {
-  console.log('[Spellbook] Showing finalize modal');
+  debugLog('[Spellbook] Showing finalize modal');
 
   // Remove any existing modal
   const existing = document.getElementById('finalize-plan-modal');
@@ -2436,7 +4306,7 @@ function cancelFinalizePlan() {
 }
 
 async function confirmFinalizePlan() {
-  console.log('[Spellbook] confirmFinalizePlan clicked');
+  debugLog('[Spellbook] confirmFinalizePlan clicked');
 
   const session = sessions.planning[sessions.activePlanningSession];
   if (!session) return;
@@ -2503,11 +4373,8 @@ async function startImplementation() {
     await fetchData();
     renderKanban();
 
-    // Update button states
-    document.getElementById('finalize-btn').classList.add('opacity-50');
-    document.getElementById('start-impl-btn').classList.add('bg-green-500/20', 'text-green-400');
-    document.getElementById('start-impl-btn').classList.remove('bg-spellbook-accent', 'text-black');
-    document.getElementById('start-impl-btn').innerHTML = '● Implementing...';
+    // Hide the manual implement fallback button since we triggered it
+    document.getElementById('manual-implement-btn')?.classList.add('hidden');
 
     updateActivity(`Invoked /implement ${ref}`);
 
@@ -2517,16 +4384,12 @@ async function startImplementation() {
   }
 }
 
-// Update action button based on item status
+// Update workflow buttons based on item status
+// The flow is now automatic - Claude auto-runs /implement after plan approval
+// These buttons are for later workflow stages or manual fallback
 function updateActionButton(itemStatus) {
-  const btn = document.getElementById('start-impl-btn');
-  const finalizeBtn = document.getElementById('finalize-btn');
-
-  // Reset button classes and show main button
-  btn.classList.remove('bg-spellbook-accent', 'text-black', 'bg-green-500/20', 'text-green-400', 'bg-blue-500', 'text-white', 'opacity-50', 'hidden');
-
-  // Hide all workflow buttons
-  ['create-pr-btn', 'code-rabbit-btn', 'finalize-item-btn'].forEach(id => {
+  // Hide all workflow buttons first
+  ['create-pr-btn', 'code-rabbit-btn', 'finalize-item-btn', 'manual-implement-btn'].forEach(id => {
     document.getElementById(id)?.classList.add('hidden');
   });
 
@@ -2534,44 +4397,28 @@ function updateActionButton(itemStatus) {
     case 'active':
     case 'planning':
     case 'not_started':
-      // Planning phase - show "Start Implementation"
-      btn.className = 'px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hover:bg-spellbook-accent/80';
-      btn.innerHTML = 'Start Implementation →';
-      btn.onclick = startImplementation;
-      btn.disabled = false;
-      finalizeBtn.classList.remove('hidden');
+      // Planning phase - show subtle fallback button in case Claude doesn't auto-implement
+      // This will be shown after a delay if needed
+      document.getElementById('manual-implement-btn')?.classList.remove('hidden');
       updateWorkflowProgress('plan');
       break;
 
     case 'in_progress':
-      // Implementation done - show "Commit & Push"
-      btn.className = 'px-4 py-2 bg-blue-500 text-white rounded font-semibold hover:bg-blue-600';
-      btn.innerHTML = 'Commit & Push →';
-      btn.onclick = startCommitWorkflow;
-      btn.disabled = false;
-      finalizeBtn.classList.add('hidden');
+      // Implementation in progress - no buttons needed, Claude is working
+      // Later: could show Commit & Push button when implementation is done
       updateWorkflowProgress('impl');
       break;
 
     case 'resolved':
     case 'completed':
     case 'complete':
-      // Item is done - show disabled state
-      btn.className = 'px-4 py-2 bg-green-500/20 text-green-400 rounded font-semibold opacity-50 cursor-not-allowed';
-      btn.innerHTML = '✓ Completed';
-      btn.onclick = null;
-      btn.disabled = true;
-      finalizeBtn.classList.add('hidden');
-      updateWorkflowProgress('review'); // All steps completed
+      // Item is done
+      updateWorkflowProgress('review');
       break;
 
     default:
-      // Fallback to implementation
-      btn.className = 'px-4 py-2 bg-spellbook-accent text-black rounded font-semibold hover:bg-spellbook-accent/80';
-      btn.innerHTML = 'Start Implementation →';
-      btn.onclick = startImplementation;
-      btn.disabled = false;
-      finalizeBtn.classList.remove('hidden');
+      // Fallback - show manual implement button
+      document.getElementById('manual-implement-btn')?.classList.remove('hidden');
       updateWorkflowProgress('plan');
   }
 }
@@ -2591,12 +4438,6 @@ async function startCommitWorkflow() {
     if (session.ws?.readyState === WebSocket.OPEN) {
       sendTerminalCommand(session.ws, '/commit-and-push');
     }
-
-    // Update button to show in progress
-    const btn = document.getElementById('start-impl-btn');
-    btn.className = 'px-4 py-2 bg-blue-500/20 text-blue-400 rounded font-semibold';
-    btn.innerHTML = '● Committing...';
-    btn.disabled = true;
 
     updateActivity(`Started commit workflow for ${ref}`);
 
@@ -2635,14 +4476,87 @@ function updateWorkflowProgress(currentStep) {
   });
 }
 
+// ==================== WORKFLOW STATE MANAGEMENT ====================
+// Tracks planning → implementing flow via external state file
+// This enables auto-triggering /implement after plan approval (even with context clear)
+
+let workflowStateInterval = null;
+let lastWorkflowStatus = null;
+
+async function fetchWorkflowState() {
+  try {
+    const res = await fetch(`${API_BASE}/workflow-state`);
+    return await res.json();
+  } catch (err) {
+    console.error('Failed to fetch workflow state:', err);
+    return { ref: null, status: null };
+  }
+}
+
+function updateWorkflowPhaseBadge(status) {
+  const badge = document.getElementById('workflow-phase-badge');
+  if (!badge) return;
+
+  // Update badge based on status
+  const statusConfig = {
+    planning: { text: 'planning', class: 'bg-blue-500/20 text-blue-400' },
+    implementing: { text: 'implementing', class: 'bg-yellow-500/20 text-yellow-400' },
+    committing: { text: 'committing', class: 'bg-purple-500/20 text-purple-400' },
+    reviewing: { text: 'reviewing', class: 'bg-orange-500/20 text-orange-400' },
+    complete: { text: 'complete', class: 'bg-green-500/20 text-green-400' },
+  };
+
+  const config = statusConfig[status] || statusConfig.planning;
+  badge.textContent = config.text;
+  badge.className = `px-2 py-0.5 text-xs rounded ${config.class}`;
+}
+
+function startWorkflowStatePolling() {
+  // Clear any existing interval
+  if (workflowStateInterval) {
+    clearInterval(workflowStateInterval);
+  }
+
+  // Poll every 2 seconds
+  workflowStateInterval = setInterval(async () => {
+    const state = await fetchWorkflowState();
+
+    // Detect status change
+    if (state.status && state.status !== lastWorkflowStatus) {
+      console.log(`[Spellbook] Workflow status changed: ${lastWorkflowStatus} → ${state.status}`);
+      lastWorkflowStatus = state.status;
+      updateWorkflowPhaseBadge(state.status);
+
+      // If status changed to "implementing", update the workflow progress
+      if (state.status === 'implementing') {
+        updateWorkflowProgress('impl');
+        showToast('info', 'Implementation started - Claude is now implementing the plan');
+      }
+    }
+  }, 2000);
+}
+
+function stopWorkflowStatePolling() {
+  if (workflowStateInterval) {
+    clearInterval(workflowStateInterval);
+    workflowStateInterval = null;
+  }
+}
+
+async function clearWorkflowState() {
+  try {
+    await fetch(`${API_BASE}/workflow-state`, { method: 'DELETE' });
+    lastWorkflowStatus = null;
+    console.log('[Spellbook] Workflow state cleared');
+  } catch (err) {
+    console.error('Failed to clear workflow state:', err);
+  }
+}
+
 // Show/hide workflow buttons
 function showWorkflowButton(buttonId) {
-  // Hide main impl button
-  document.getElementById('start-impl-btn').classList.add('hidden');
-  document.getElementById('finalize-btn').classList.add('hidden');
-
   // Hide all workflow buttons first
-  ['create-pr-btn', 'code-rabbit-btn', 'finalize-item-btn'].forEach(id => {
+  ['create-pr-btn', 'code-rabbit-btn', 'finalize-item-btn', 'manual-implement-btn'].forEach(id => {
     document.getElementById(id)?.classList.add('hidden');
   });
 
@@ -2792,92 +4706,362 @@ function exitClaudeTerminal() {
 
 // ==================== SESSION PILLS (Status Bar) ====================
 
+// Interval reference for periodic iTerm session refresh
+let itermSessionsRefreshInterval = null;
+const ITERM_SESSIONS_REFRESH_MS = 5000; // Refresh every 5 seconds
+
 function renderSessionPills() {
   const container = document.getElementById('session-pills');
-  const sessionKeys = Object.keys(sessions.planning);
 
-  if (sessionKeys.length === 0) {
-    container.innerHTML = '<span class="text-xs text-spellbook-muted">No active sessions</span>';
+  // Filter to only show sessions with Claude running
+  const claudeSessions = itermSessions.filter(s => s.hasClaude !== false);
+
+  if (claudeSessions.length === 0) {
+    container.innerHTML = '<span class="text-xs text-spellbook-muted">No active Claude sessions</span>';
     return;
   }
 
-  container.innerHTML = sessionKeys.map(key => {
-    const session = sessions.planning[key];
-    const isActive = sessions.activePlanningSession === key;
-    const statusDot = session.status === 'minimized' ? '○' : '●';
-    const statusColor = isActive ? 'text-green-400' : session.status === 'minimized' ? 'text-yellow-400' : 'text-blue-400';
+  container.innerHTML = claudeSessions.map(session => {
+    const sessionName = session.name || session;
+    const tty = session.tty || '';
+    const matchedItem = session.matchedItem;
+    const displayName = matchedItem || sessionName;
+    const statusColor = session.hasClaude ? 'text-green-400' : 'text-gray-400';
 
     return `
-      <button onclick="resumePlanningSession('${key}')"
-              class="px-2 py-0.5 text-xs rounded flex items-center gap-1 ${isActive ? 'bg-spellbook-accent/20 text-spellbook-accent' : 'bg-spellbook-card hover:bg-spellbook-border'}">
-        <span class="${statusColor}">${statusDot}</span>
-        ${key}
+      <button onclick="handleSessionPillClick('${escapeHtml(sessionName)}', '${escapeHtml(tty)}', '${escapeHtml(matchedItem || '')}')"
+              class="px-2 py-0.5 text-xs rounded flex items-center gap-1 bg-spellbook-card hover:bg-spellbook-border group"
+              title="Click to focus iTerm, Shift+Click for docs">
+        <span class="${statusColor}">●</span>
+        ${escapeHtml(displayName)}
       </button>
     `;
   }).join('');
 }
 
+/**
+ * Handle click on session pill - focus iTerm or open docs
+ */
+function handleSessionPillClick(sessionName, tty, matchedItem) {
+  if (event.shiftKey && matchedItem) {
+    viewSessionDocs(matchedItem);
+  } else {
+    focusItermSession(sessionName, tty);
+  }
+}
+
+/**
+ * Start periodic refresh of iTerm sessions for pills
+ */
+function startItermSessionsRefresh() {
+  if (itermSessionsRefreshInterval) return; // Already running
+
+  // Initial fetch
+  refreshItermSessionsForPills();
+
+  // Set up periodic refresh
+  itermSessionsRefreshInterval = setInterval(() => {
+    if (isPageVisible) {
+      refreshItermSessionsForPills();
+    }
+  }, ITERM_SESSIONS_REFRESH_MS);
+}
+
+/**
+ * Refresh iTerm sessions and update pills
+ */
+async function refreshItermSessionsForPills() {
+  try {
+    const res = await fetch(`${API_BASE}/iterm/sessions`);
+    const data = await res.json();
+    itermSessions = data.sessions || [];
+  } catch (err) {
+    console.warn('[Spellbook] Failed to fetch iTerm sessions for pills:', err);
+  }
+  renderSessionPills();
+}
+
 // ==================== TERMINAL MANAGER VIEW ====================
 
-function renderSessionsGrid() {
-  const container = document.getElementById('sessions-grid');
-  const sessionKeys = Object.keys(sessions.planning);
+// Preview refresh interval reference
+let previewRefreshInterval = null;
+const PREVIEW_REFRESH_MS = 2500; // Refresh previews every 2.5 seconds
+const PREVIEW_MAX_LINES = 10; // Show last 10 lines in preview
 
-  if (sessionKeys.length === 0) {
+/**
+ * Fetch terminal preview for a session
+ */
+async function fetchTerminalPreview(terminalId) {
+  if (!terminalId) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/terminals/${terminalId}/preview?lines=${PREVIEW_MAX_LINES}`);
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    return data.lines || [];
+  } catch (err) {
+    console.warn(`[Spellbook] Failed to fetch preview for terminal ${terminalId}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Escape HTML to prevent XSS in preview content
+ */
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+/**
+ * Strip ANSI escape codes from text
+ */
+function stripAnsi(text) {
+  // Remove all ANSI escape sequences
+  // This regex matches: ESC[ followed by parameters and a final byte
+  // Also matches OSC sequences (ESC]) and other escape sequences
+  return text
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')  // CSI sequences like [?25h, [0m, [32m
+    .replace(/\x1b\][^\x07]*\x07/g, '')      // OSC sequences (title changes)
+    .replace(/\x1b[PX^_][^\x1b]*\x1b\\/g, '') // DCS, SOS, PM, APC sequences
+    .replace(/\x1b[\x40-\x5f]/g, '')          // Fe sequences
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, ''); // Other control chars
+}
+
+/**
+ * Truncate long lines for preview display
+ */
+function truncateLine(line, maxLength = 100) {
+  // Strip ANSI codes first
+  const clean = stripAnsi(line);
+  if (clean.length <= maxLength) return clean;
+  return clean.substring(0, maxLength - 3) + '...';
+}
+
+/**
+ * Update preview content for a single session card
+ */
+async function updateSessionPreview(sessionKey) {
+  const session = sessions.planning[sessionKey];
+  if (!session?.terminalId) return;
+
+  const previewEl = document.getElementById(`preview-${sessionKey}`);
+  if (!previewEl) return;
+
+  const lines = await fetchTerminalPreview(session.terminalId);
+
+  if (lines && lines.length > 0) {
+    // Don't use escapeHtml since .textContent already handles escaping
+    const formattedLines = lines
+      .map(line => truncateLine(line, 80))
+      .join('\n');
+    previewEl.textContent = formattedLines;
+    previewEl.classList.remove('text-spellbook-muted');
+    previewEl.classList.add('text-spellbook-text');
+  } else {
+    previewEl.textContent = 'No output yet...';
+    previewEl.classList.add('text-spellbook-muted');
+    previewEl.classList.remove('text-spellbook-text');
+  }
+}
+
+/**
+ * Update all session previews
+ */
+async function updateAllSessionPreviews() {
+  const sessionKeys = Object.keys(sessions.planning);
+  if (sessionKeys.length === 0) return;
+
+  // Update previews in parallel
+  await Promise.all(sessionKeys.map(key => updateSessionPreview(key)));
+}
+
+/**
+ * Start periodic preview refresh
+ */
+function startPreviewRefresh() {
+  if (previewRefreshInterval) return; // Already running
+
+  // Initial fetch
+  updateAllSessionPreviews();
+
+  // Set up periodic refresh
+  previewRefreshInterval = setInterval(() => {
+    // Only refresh if terminal manager view is visible
+    const terminalView = document.getElementById('terminal-manager-view');
+    if (terminalView && !terminalView.classList.contains('hidden')) {
+      updateAllSessionPreviews();
+    }
+  }, PREVIEW_REFRESH_MS);
+}
+
+/**
+ * Stop periodic preview refresh
+ */
+function stopPreviewRefresh() {
+  if (previewRefreshInterval) {
+    clearInterval(previewRefreshInterval);
+    previewRefreshInterval = null;
+  }
+}
+
+// Store detected iTerm sessions
+let itermSessions = [];
+
+/**
+ * Fetch and render iTerm sessions
+ */
+async function refreshItermSessions() {
+  const container = document.getElementById('sessions-grid');
+
+  try {
+    const res = await fetch(`${API_BASE}/iterm/sessions`);
+    const data = await res.json();
+    itermSessions = data.sessions || [];
+  } catch (err) {
+    console.error('Failed to fetch iTerm sessions:', err);
+    itermSessions = [];
+  }
+
+  renderItermSessionsGrid();
+  renderSessionPills();
+}
+
+function renderItermSessionsGrid() {
+  const container = document.getElementById('sessions-grid');
+
+  if (itermSessions.length === 0) {
     container.innerHTML = `
-      <div class="text-center text-spellbook-muted py-8 col-span-3">
-        No active sessions. Click an item on the Kanban board to start planning.
+      <div class="text-center text-spellbook-muted py-8 col-span-4">
+        No active iTerm sessions detected. Click "Work on this" on an item to start.
       </div>
     `;
     return;
   }
 
-  container.innerHTML = sessionKeys.map(key => {
-    const session = sessions.planning[key];
-    const isActive = sessions.activePlanningSession === key;
-    const statusText = isActive ? 'Active' : session.status === 'minimized' ? 'Minimized' : 'Idle';
-    const statusColor = isActive ? 'text-green-400' : session.status === 'minimized' ? 'text-yellow-400' : 'text-spellbook-muted';
+  container.innerHTML = itermSessions.map(session => {
+    // Session is now an object: { name, tty, hasClaude, matchedItem }
+    const sessionName = session.name || session; // Handle both old string format and new object format
+    const tty = session.tty || '';
+    const hasClaude = session.hasClaude !== false;
+    const matchedItem = session.matchedItem;
+
+    // Try to find the item in state
+    let item = null;
+    if (matchedItem) {
+      const match = matchedItem.match(/(bug|improvement|feature)-(\d+)/i);
+      if (match) {
+        const type = match[1].toLowerCase();
+        const number = parseInt(match[2]);
+        if (type === 'bug') item = state.bugs?.find(b => b.number === number);
+        else if (type === 'improvement') item = state.improvements?.find(i => i.number === number);
+        else if (type === 'feature') item = state.features?.find(f => f.number === number);
+      }
+    }
+
+    const title = item?.title || item?.name || sessionName;
+    const priority = item?.priority || 'medium';
+    const statusIndicator = hasClaude ? '● Claude running' : '○ No Claude';
+    const statusColor = hasClaude ? 'text-green-400' : 'text-gray-400';
+    const itemRef = matchedItem || 'unlinked';
 
     return `
-      <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3 ${isActive ? 'border-spellbook-accent' : ''}">
+      <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3 hover:border-spellbook-accent transition-colors">
         <div class="flex items-center justify-between mb-2">
-          <span class="font-semibold text-spellbook-accent">${key}</span>
-          <span class="text-xs ${statusColor}">● ${statusText}</span>
+          <span class="font-semibold text-spellbook-accent">${escapeHtml(sessionName)}</span>
+          <span class="text-xs ${statusColor}">${statusIndicator}</span>
         </div>
-        <div class="text-xs text-spellbook-muted mb-3">
-          Last activity: ${session.lastActivity ? new Date(session.lastActivity).toLocaleTimeString() : 'Unknown'}
+        <div class="text-xs text-spellbook-muted mb-1">
+          ${matchedItem ? `<span class="text-spellbook-accent">${escapeHtml(matchedItem)}</span>` : '<span class="text-gray-500">No linked item</span>'}
+        </div>
+        <div class="text-xs text-spellbook-muted mb-3 truncate" title="${escapeHtml(title)}">
+          ${escapeHtml(title.substring(0, 50))}${title.length > 50 ? '...' : ''}
         </div>
         <div class="flex gap-2">
-          <button onclick="resumePlanningSession('${key}')"
+          <button onclick="focusItermSession('${escapeHtml(sessionName)}', '${escapeHtml(tty)}')"
                   class="flex-1 px-2 py-1 text-xs bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30">
-            Open
+            Focus
           </button>
-          <button onclick="closeSessionFromGrid('${key}')"
-                  class="px-2 py-1 text-xs bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
-            ✕
+          ${matchedItem ? `
+          <button onclick="viewSessionDocs('${escapeHtml(matchedItem)}')"
+                  class="px-2 py-1 text-xs bg-blue-500/20 text-blue-400 rounded hover:bg-blue-500/30">
+            Docs
           </button>
+          ` : ''}
         </div>
       </div>
     `;
   }).join('');
 }
 
+/**
+ * Focus an iTerm session by name or TTY
+ */
+async function focusItermSession(sessionName, tty = '') {
+  try {
+    const res = await fetch(`${API_BASE}/iterm/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName, tty }),
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast('success', `Focused iTerm: ${sessionName}`);
+    } else {
+      showToast('error', result.error || 'Failed to focus iTerm');
+    }
+  } catch (err) {
+    showToast('error', `Error: ${err.message}`);
+  }
+}
+
+/**
+ * View documentation for a session (accepts matched item reference like "bug-79")
+ */
+function viewSessionDocs(itemRef) {
+  const match = itemRef.match(/(bug|improvement|feature)-(\d+)/i);
+  if (match) {
+    const type = match[1].toLowerCase();
+    const number = parseInt(match[2]);
+    openPlanningView(type, number);
+  } else {
+    showToast('error', 'Could not determine item from reference: ' + itemRef);
+  }
+}
+
+// Keep old function for backwards compatibility but make it call the new one
+function renderSessionsGrid() {
+  refreshItermSessions();
+}
+
 async function closeSessionFromGrid(sessionKey) {
   if (!confirm(`Close session ${sessionKey}?`)) return;
+
+  debugLog(`[Spellbook] closeSessionFromGrid called for ${sessionKey}`);
 
   const session = sessions.planning[sessionKey];
   if (session?.terminalId) {
     try {
-      await fetch(`${API_BASE}/terminals/${session.terminalId}`, { method: 'DELETE' });
+      debugLog(`[Spellbook] Sending DELETE request for terminal ${session.terminalId}`);
+      const res = await fetch(`${API_BASE}/terminals/${session.terminalId}`, { method: 'DELETE' });
+      const result = await res.json();
+      debugLog('[Spellbook] Terminal close result:', result);
     } catch (err) {
       console.error('Failed to close terminal:', err);
     }
+  } else {
+    debugLog('[Spellbook] No terminal ID to close');
   }
 
-  if (session?.ws) session.ws.close();
-  if (session?.term) session.term.dispose();
+  // Clean up resources properly
+  cleanupSession(session);
 
   delete sessions.planning[sessionKey];
+
+  // Update session storage
+  saveSessionsToStorage();
 
   if (sessions.activePlanningSession === sessionKey) {
     sessions.activePlanningSession = null;
@@ -2885,7 +5069,8 @@ async function closeSessionFromGrid(sessionKey) {
   }
 
   renderSessionsGrid();
-  renderSessionPills();
+  debugLog(`[Spellbook] Session ${sessionKey} closed`);
+  // Note: Session pills will be refreshed by the periodic iTerm session poll
 }
 
 function closeAllIdleSessions() {
@@ -3001,6 +5186,17 @@ function setKanbanSort(sortBy) {
   renderKanban();
 }
 
+function handleKanbanSearch(query) {
+  state.kanbanSearch = query.toLowerCase().trim();
+  renderKanban();
+}
+
+function clearKanbanSearch() {
+  state.kanbanSearch = '';
+  document.getElementById('kanban-search').value = '';
+  renderKanban();
+}
+
 function sortKanbanItems(items) {
   const priorityOrder = { high: 0, critical: 0, medium: 1, low: 2 };
 
@@ -3064,6 +5260,18 @@ function renderKanban() {
     });
   }
 
+  // Apply search filter
+  if (state.kanbanSearch) {
+    items = items.filter(i => {
+      const title = (i.title || i.name || '').toLowerCase();
+      const ref = i.ref?.toLowerCase() || '';
+      const slug = i.slug?.toLowerCase() || '';
+      return title.includes(state.kanbanSearch) ||
+             ref.includes(state.kanbanSearch) ||
+             slug.includes(state.kanbanSearch);
+    });
+  }
+
   // Categorize by status
   let backlog = items.filter(i =>
     ['active', 'backlog', 'logged', 'not_started'].includes(i.status)
@@ -3072,7 +5280,7 @@ function renderKanban() {
     ['planning', 'planned', 'spec_draft', 'spec_ready'].includes(i.status)
   );
   let inProgress = items.filter(i =>
-    ['in_progress', 'in-progress', 'implementing'].includes(i.status)
+    ['in_progress', 'in-progress', 'implementing', 'pr_open', 'review'].includes(i.status)
   );
   let done = items.filter(i =>
     ['resolved', 'completed', 'done', 'complete', 'merged'].includes(i.status)
@@ -3099,7 +5307,8 @@ function renderKanban() {
 }
 
 function emptyColumn() {
-  return '<div class="text-spellbook-muted text-xs text-center py-4">No items</div>';
+  const message = state.kanbanSearch ? 'No matching items' : 'No items';
+  return `<div class="text-spellbook-muted text-xs text-center py-4">${message}</div>`;
 }
 
 function renderKanbanCard(item, column) {
@@ -3265,6 +5474,224 @@ function toggleWorktrees() {
   toggle.textContent = dropdown.classList.contains('hidden') ? '▼' : '▲';
 }
 
+// ==================== WORKTREES VIEW AUTO-REFRESH ====================
+
+let worktreesRefreshInterval = null;
+const WORKTREES_REFRESH_MS = 3000; // Refresh every 3 seconds
+
+/**
+ * Start periodic worktrees refresh (for when cleanup skill is running)
+ */
+function startWorktreesRefresh() {
+  if (worktreesRefreshInterval) return; // Already running
+
+  worktreesRefreshInterval = setInterval(async () => {
+    // Only refresh if worktrees view is visible
+    const worktreesView = document.getElementById('worktrees-view');
+    if (worktreesView && !worktreesView.classList.contains('hidden')) {
+      await loadWorktrees();
+      renderWorktreesView();
+    }
+  }, WORKTREES_REFRESH_MS);
+}
+
+/**
+ * Stop periodic worktrees refresh
+ */
+function stopWorktreesRefresh() {
+  if (worktreesRefreshInterval) {
+    clearInterval(worktreesRefreshInterval);
+    worktreesRefreshInterval = null;
+  }
+}
+
+// Load worktrees view (full page view)
+async function loadWorktreesView() {
+  await loadWorktrees();
+  renderWorktreesView();
+
+  // Initialize worktree terminal if not already running
+  if (!sessions.worktreeTerminal?.terminalId) {
+    await initWorktreeTerminal();
+  } else {
+    // Terminal already exists, just ensure fitAddon resizes correctly
+    setTimeout(() => {
+      if (sessions.worktreeTerminal?.fitAddon) {
+        sessions.worktreeTerminal.fitAddon.fit();
+      }
+    }, 100);
+  }
+
+  // Start auto-refresh for worktrees (so cleanup skill results are visible)
+  startWorktreesRefresh();
+}
+
+// Refresh worktrees view
+async function refreshWorktreesView() {
+  await loadWorktrees();
+  renderWorktreesView();
+  updateActivity('Refreshed worktrees');
+}
+
+// Render full worktrees view
+function renderWorktreesView() {
+  const container = document.getElementById('worktrees-list');
+  const projectPath = document.getElementById('worktrees-project-path');
+  const countEl = document.getElementById('worktrees-count');
+
+  // Update project path
+  if (projectPath && state.project?.path) {
+    projectPath.textContent = state.project.path;
+  }
+
+  // Update stats
+  const totalWorktrees = state.worktrees.length;
+  const activeWorktrees = state.worktrees.filter(w => w.status === 'active').length;
+  const assignedWorktrees = state.worktrees.filter(w => w.working_on).length;
+  const mainRepo = state.worktrees.filter(w => w.path === state.project?.path).length;
+
+  const statTotal = document.getElementById('wt-stat-total');
+  const statActive = document.getElementById('wt-stat-active');
+  const statAssigned = document.getElementById('wt-stat-assigned');
+  const statMain = document.getElementById('wt-stat-main');
+
+  if (statTotal) statTotal.textContent = totalWorktrees;
+  if (statActive) statActive.textContent = activeWorktrees;
+  if (statAssigned) statAssigned.textContent = assignedWorktrees;
+  if (statMain) statMain.textContent = mainRepo;
+
+  // Update count
+  if (countEl) countEl.textContent = `${totalWorktrees} worktree${totalWorktrees !== 1 ? 's' : ''}`;
+
+  if (!container) return;
+
+  if (state.worktrees.length === 0) {
+    container.innerHTML = `
+      <div class="text-center text-spellbook-muted py-12">
+        <div class="text-4xl mb-4">🌲</div>
+        <div class="text-lg mb-2">No Worktrees</div>
+        <div class="text-sm">Worktrees allow parallel development on different branches.</div>
+        <div class="text-sm mt-2">Create one from the planning view or use the worktree-manager skill.</div>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = state.worktrees.map(w => {
+    const isMain = w.path === state.project?.path;
+    const shortPath = w.path.split('/').slice(-3).join('/');
+    const statusColor = w.status === 'active' ? 'text-green-400' :
+                       w.status === 'merged' ? 'text-purple-400' :
+                       w.status === 'abandoned' ? 'text-red-400' : 'text-spellbook-muted';
+
+    return `
+      <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-4 hover:border-spellbook-accent/50 transition-colors">
+        <div class="flex items-start justify-between">
+          <div class="flex-1">
+            <!-- Branch and status -->
+            <div class="flex items-center gap-3 mb-2">
+              ${isMain ? '<span class="text-spellbook-accent text-lg">●</span>' : '<span class="text-spellbook-muted text-lg">○</span>'}
+              <span class="font-semibold text-spellbook-accent">${w.branch || 'unknown'}</span>
+              <span class="text-xs px-2 py-0.5 rounded ${statusColor} bg-spellbook-bg">${w.status || 'active'}</span>
+              ${isMain ? '<span class="text-xs px-2 py-0.5 rounded bg-purple-500/20 text-purple-400">MAIN</span>' : ''}
+            </div>
+
+            <!-- Working on -->
+            ${w.working_on ? `
+              <div class="flex items-center gap-2 mb-2 ml-7">
+                <span class="text-xs text-spellbook-muted">Working on:</span>
+                <span class="text-xs text-blue-400 font-mono">${w.working_on}</span>
+              </div>
+            ` : ''}
+
+            <!-- Path -->
+            <div class="flex items-center gap-2 ml-7">
+              <span class="text-xs text-spellbook-muted">Path:</span>
+              <span class="text-xs font-mono text-spellbook-muted/70 truncate" title="${w.path}">${shortPath}</span>
+            </div>
+
+            <!-- Ports -->
+            ${w.ports && w.ports.length > 0 ? `
+              <div class="flex items-center gap-2 ml-7 mt-2">
+                <span class="text-xs text-spellbook-muted">Ports:</span>
+                <div class="flex flex-wrap gap-1">
+                  ${w.ports.map(p => `
+                    <a href="http://localhost:${p}" target="_blank"
+                       class="text-xs font-mono px-2 py-0.5 rounded bg-green-500/20 text-green-400 hover:bg-green-500/30 transition-colors">
+                      :${p}
+                    </a>
+                  `).join('')}
+                </div>
+              </div>
+            ` : ''}
+          </div>
+
+          <!-- Actions -->
+          <div class="flex items-center gap-2">
+            ${!isMain ? `
+              <button onclick="closeWorktree('${w.path.replace(/'/g, "\\'")}')"
+                      class="px-3 py-1.5 text-xs bg-red-500/20 text-red-400 rounded hover:bg-red-500/30 transition-colors"
+                      title="Close and remove this worktree">
+                Close
+              </button>
+            ` : ''}
+            <button onclick="openWorktreeInTerminal('${w.path.replace(/'/g, "\\'")}')"
+                    class="px-3 py-1.5 text-xs bg-spellbook-accent/20 text-spellbook-accent rounded hover:bg-spellbook-accent/30 transition-colors"
+                    title="Open terminal in this worktree">
+              Terminal
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// Close a worktree via terminal - populates skill command
+async function closeWorktree(path) {
+  const session = sessions.worktreeTerminal;
+  if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) {
+    showToast('error', 'Worktree terminal not connected. Please wait for it to initialize.');
+    return;
+  }
+
+  // Send the worktree-manager skill command to the terminal (don't auto-execute, let user confirm)
+  const skillCmd = `/worktree-manager cleanup ${path}`;
+
+  session.ws.send(JSON.stringify({ type: 'input', data: skillCmd }));
+
+  showToast('info', 'Command populated in terminal - press Enter to execute');
+  updateActivity(`Prepared worktree cleanup: ${path.split('/').slice(-2).join('/')}`);
+}
+
+// Open terminal in worktree directory
+async function openWorktreeInTerminal(path) {
+  try {
+    // Create a new terminal at the worktree path
+    const res = await fetch(`${API_BASE}/terminals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cwd: path,
+        name: `WT: ${path.split('/').slice(-2).join('/')}`,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error('Failed to create terminal');
+    }
+
+    const data = await res.json();
+
+    // Switch to terminals view
+    switchMainView('terminals');
+    updateActivity(`Opened terminal at: ${path.split('/').slice(-2).join('/')}`);
+  } catch (err) {
+    console.error('Failed to open terminal:', err);
+    alert(`Failed to open terminal: ${err.message}`);
+  }
+}
+
 // Find worktree associated with an item
 function findItemWorktree(itemType, itemNumber) {
   const ref = `${itemType}-${itemNumber}`;
@@ -3387,8 +5814,13 @@ async function loadKnowledgeBase() {
   try {
     const res = await fetch(`${API_BASE}/knowledge`);
     const data = await res.json();
-    state.knowledgeBase = data.files || [];
-    renderKnowledgeBase();
+    state.knowledgeBase = data.tree || [];  // API returns 'tree' not 'files'
+    state.knowledgeStats = data.stats || { totalDocs: 0, totalCategories: 0 };
+    state.knowledgeRoot = data.root || '';
+    // Only render if we're currently on the knowledge view
+    if (state.currentView === 'knowledge') {
+      renderKnowledgeBase();
+    }
   } catch (err) {
     console.error('Failed to load knowledge base:', err);
     state.knowledgeBase = [];
@@ -3396,22 +5828,77 @@ async function loadKnowledgeBase() {
 }
 
 function renderKnowledgeBase() {
-  const container = document.getElementById('kb-list');
-  if (!state.knowledgeBase || state.knowledgeBase.length === 0) {
-    container.innerHTML = '<div class="p-3 text-xs text-spellbook-muted">No documents found</div>';
+  const container = document.getElementById('kb-file-tree');
+  if (!container) {
+    debugLog('[KnowledgeBase] Container kb-file-tree not found, skipping render');
     return;
   }
 
-  container.innerHTML = state.knowledgeBase.map(file => `
-    <div class="flex items-center gap-3 py-2 px-3 hover:bg-spellbook-bg cursor-pointer border-b border-spellbook-border last:border-0"
-         onclick="viewKnowledgeDoc('${escapeHtml(file.path)}', '${escapeHtml(file.name)}')">
-      <span class="text-lg">📄</span>
-      <div class="flex-1 min-w-0">
-        <div class="text-sm text-spellbook-text">${escapeHtml(file.name)}</div>
-        <div class="text-xs text-spellbook-muted truncate">${escapeHtml(file.category || 'general')}</div>
-      </div>
-    </div>
-  `).join('');
+  // Update stats
+  if (state.knowledgeStats) {
+    const totalEl = document.getElementById('kb-stat-total');
+    const catEl = document.getElementById('kb-stat-categories');
+    if (totalEl) totalEl.textContent = state.knowledgeStats.totalDocs || 0;
+    if (catEl) catEl.textContent = state.knowledgeStats.totalCategories || 0;
+  }
+
+  // Update root path
+  if (state.knowledgeRoot) {
+    const rootEl = document.getElementById('kb-root-path');
+    if (rootEl) rootEl.textContent = state.knowledgeRoot;
+  }
+
+  if (!state.knowledgeBase || state.knowledgeBase.length === 0) {
+    container.innerHTML = '<div class="text-center text-spellbook-muted py-8 text-sm">No documents found</div>';
+    return;
+  }
+
+  container.innerHTML = renderKBTree(state.knowledgeBase, 0);
+}
+
+function renderKBTree(items, depth) {
+  if (!items || items.length === 0) return '';
+
+  return items.map(item => {
+    const indent = depth * 12;
+
+    if (item.type === 'folder') {
+      const folderId = `kb-folder-${item.path.replace(/[^a-zA-Z0-9]/g, '-')}`;
+      return `
+        <div class="kb-folder">
+          <div class="flex items-center gap-2 py-1.5 px-2 hover:bg-spellbook-bg cursor-pointer rounded text-sm"
+               style="padding-left: ${indent + 8}px"
+               onclick="toggleKBFolder('${folderId}')">
+            <span id="${folderId}-icon" class="text-xs text-spellbook-muted transition-transform">▼</span>
+            <span class="text-blue-400">📁</span>
+            <span class="text-spellbook-text">${escapeHtml(item.name)}</span>
+          </div>
+          <div id="${folderId}" class="kb-folder-contents">
+            ${renderKBTree(item.children || [], depth + 1)}
+          </div>
+        </div>
+      `;
+    } else {
+      return `
+        <div class="flex items-center gap-2 py-1.5 px-2 hover:bg-spellbook-accent/10 cursor-pointer rounded text-sm"
+             style="padding-left: ${indent + 8}px"
+             onclick="viewKnowledgeDoc('${escapeHtml(item.path)}', '${escapeHtml(item.name)}')">
+          <span class="text-spellbook-muted">📄</span>
+          <span class="text-spellbook-text truncate">${escapeHtml(item.name.replace('.md', ''))}</span>
+        </div>
+      `;
+    }
+  }).join('');
+}
+
+function toggleKBFolder(folderId) {
+  const contents = document.getElementById(folderId);
+  const icon = document.getElementById(`${folderId}-icon`);
+  if (contents && icon) {
+    const isHidden = contents.classList.toggle('hidden');
+    icon.textContent = isHidden ? '▶' : '▼';
+    icon.style.transform = isHidden ? '' : '';
+  }
 }
 
 function toggleKnowledgeBase() {
@@ -3439,19 +5926,96 @@ function closeKBOnClickOutside(e) {
 }
 
 async function viewKnowledgeDoc(path, name) {
-  document.getElementById('knowledge-base').classList.add('hidden');
-  document.getElementById('kb-toggle').textContent = '▼';
+  // Update title and path in the right panel
+  const titleEl = document.getElementById('kb-doc-title');
+  const pathEl = document.getElementById('kb-doc-path');
+  const actionsEl = document.getElementById('kb-doc-actions');
+  const viewEl = document.getElementById('kb-doc-view');
+
+  if (titleEl) titleEl.textContent = name.replace('.md', '');
+  if (pathEl) {
+    pathEl.textContent = path;
+    pathEl.classList.remove('hidden');
+  }
+  if (actionsEl) actionsEl.classList.remove('hidden');
+  if (viewEl) viewEl.innerHTML = '<div class="text-center text-spellbook-muted py-8">Loading...</div>';
+
+  // Store current doc info for editing
+  state.currentKBDoc = { path, name };
 
   try {
     const res = await fetch(`${API_BASE}/knowledge/doc?path=${encodeURIComponent(path)}`);
     const data = await res.json();
 
-    if (data.content) {
-      showDocViewer(name, path, data.content);
+    if (data.content && viewEl) {
+      // Render markdown to HTML
+      viewEl.innerHTML = renderMarkdown(data.content);
+      state.currentKBDoc.content = data.content;
     }
   } catch (err) {
     console.error('Failed to load document:', err);
-    alert('Failed to load document');
+    if (viewEl) viewEl.innerHTML = '<div class="text-center text-red-400 py-8">Failed to load document</div>';
+  }
+}
+
+function renderMarkdown(content) {
+  // Simple markdown rendering - convert headers, code blocks, lists, etc.
+  let html = escapeHtml(content);
+
+  // Code blocks (must be first)
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="bg-spellbook-bg p-4 rounded overflow-x-auto text-sm"><code>$2</code></pre>');
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code class="bg-spellbook-bg px-1 rounded text-sm">$1</code>');
+
+  // Headers with IDs for anchor links
+  html = html.replace(/^### (.+)$/gm, (match, title) => {
+    const id = slugify(title);
+    return `<h3 id="${id}" class="text-lg font-bold text-spellbook-accent mt-6 mb-2">${title}</h3>`;
+  });
+  html = html.replace(/^## (.+)$/gm, (match, title) => {
+    const id = slugify(title);
+    return `<h2 id="${id}" class="text-xl font-bold text-spellbook-accent mt-8 mb-3">${title}</h2>`;
+  });
+  html = html.replace(/^# (.+)$/gm, (match, title) => {
+    const id = slugify(title);
+    return `<h1 id="${id}" class="text-2xl font-bold text-spellbook-accent mt-8 mb-4">${title}</h1>`;
+  });
+
+  // Bold and italic
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+  // Links - handle anchor links specially for scrolling
+  html = html.replace(/\[([^\]]+)\]\(#([^)]+)\)/g, '<a href="#$2" class="text-spellbook-accent hover:underline" onclick="scrollToAnchor(\'$2\'); return false;">$1</a>');
+  html = html.replace(/\[([^\]]+)\]\(([^#][^)]*)\)/g, '<a href="$2" class="text-spellbook-accent hover:underline" target="_blank">$1</a>');
+
+  // Lists
+  html = html.replace(/^- (.+)$/gm, '<li class="ml-4">$1</li>');
+  html = html.replace(/^(\d+)\. (.+)$/gm, '<li class="ml-4">$2</li>');
+
+  // Paragraphs (double newlines)
+  html = html.replace(/\n\n/g, '</p><p class="mb-4">');
+  html = '<p class="mb-4">' + html + '</p>';
+
+  // Clean up empty paragraphs
+  html = html.replace(/<p class="mb-4"><\/p>/g, '');
+
+  return html;
+}
+
+function slugify(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function scrollToAnchor(anchorId) {
+  const viewEl = document.getElementById('kb-doc-view');
+  const targetEl = document.getElementById(anchorId);
+  if (viewEl && targetEl) {
+    targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 }
 
@@ -3490,7 +6054,12 @@ function hideDocViewer() {
 // ==================== UTILITY ====================
 
 function updateActivity(message) {
-  document.getElementById('activity-feed').textContent = message;
+  const feed = document.getElementById('activity-feed');
+  if (feed) {
+    feed.textContent = message;
+  } else {
+    debugLog('[Activity]', message);
+  }
 }
 
 function updateStats() {
@@ -3504,10 +6073,16 @@ function updateStats() {
 window.closePlanningView = closePlanningView;
 window.minimizePlanningView = minimizePlanningView;
 window.openPlanningView = openPlanningView;
+window.openActivityItem = openActivityItem;
 window.openPlanningFromModal = openPlanningFromModal;
 window.hideItemDetailModal = hideItemDetailModal;
 window.showWorkModeModal = showWorkModeModal;
 window.hideWorkModeModal = hideWorkModeModal;
+window.showWorktreeProgressModal = showWorktreeProgressModal;
+window.hideWorktreeProgressModal = hideWorktreeProgressModal;
+window.cancelWorktreeProgress = cancelWorktreeProgress;
+window.continueFromProgress = continueFromProgress;
+window.retryWorktreeCreation = retryWorktreeCreation;
 window.submitWorkMode = submitWorkMode;
 window.handleWorktreeAction = handleWorktreeAction;
 window.quickLog = quickLog;
@@ -3520,15 +6095,21 @@ window.setKanbanSort = setKanbanSort;
 window.switchMainView = switchMainView;
 window.toggleKnowledgeBase = toggleKnowledgeBase;
 window.toggleWorktrees = toggleWorktrees;
+window.refreshWorktreesView = refreshWorktreesView;
+window.closeWorktree = closeWorktree;
+window.openWorktreeInTerminal = openWorktreeInTerminal;
+window.initWorktreeTerminal = initWorktreeTerminal;
 window.setDetailTab = setDetailTab;
 window.openDocInEditor = openDocInEditor;
 window.quickFinalize = quickFinalize;
 window.setPlanningDocTab = setPlanningDocTab;
 window.finalizePlanning = finalizePlanning;
+window.triggerImplementSkill = triggerImplementSkill;
 window.startImplementation = startImplementation;
 window.exitClaudeTerminal = exitClaudeTerminal;
 window.hideDocViewer = hideDocViewer;
 window.viewKnowledgeDoc = viewKnowledgeDoc;
+window.scrollToAnchor = scrollToAnchor;
 window.setInboxFilter = setInboxFilter;
 window.refreshDashboard = refreshDashboard;
 window.startNewInvestigation = startNewInvestigation;
@@ -3540,3 +6121,6 @@ window.setTMDocTab = setTMDocTab;
 window.createPullRequest = createPullRequest;
 window.startCodeRabbitReview = startCodeRabbitReview;
 window.finalizeItem = finalizeItem;
+window.reconnectSession = reconnectSession;
+window.reconnectAllSessions = reconnectAllSessions;
+window.dismissReconnectPrompt = dismissReconnectPrompt;

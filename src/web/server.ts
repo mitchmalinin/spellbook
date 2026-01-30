@@ -2,9 +2,10 @@ import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createHttpServer, Server } from 'http';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync, statSync } from 'fs';
+import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync, statSync, unlinkSync, copyFileSync, symlinkSync, lstatSync, rmSync } from 'fs';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
+import multer from 'multer';
 import { terminalManager, CreateTerminalOptions } from './terminal-manager.js';
 import { debouncedSync } from '../utils/git-sync.js';
 import { createBugFile, createImprovementFile, generateSlug, updateFileStatus } from '../utils/file-creator.js';
@@ -33,6 +34,7 @@ import {
   createImprovement,
   getNextImprovementNumber,
   getWorktreesByProject,
+  updateWorktree,
   PROJECTS_DIR,
   Bug,
   Improvement,
@@ -127,8 +129,276 @@ Read this plan file. We're in the planning phase. Start by reviewing the main do
 `;
 }
 
+// Global worktree registry path
+const WORKTREE_REGISTRY_PATH = join(homedir(), '.claude', 'worktree-registry.json');
+const WORKTREE_CONFIG_PATH = join(homedir(), '.claude', 'skills', 'worktree-manager', 'config.json');
+
+interface WorktreeRegistryEntry {
+  id: string;
+  project: string;
+  repoPath: string;
+  branch: string;
+  branchSlug: string;
+  worktreePath: string;
+  ports: number[];
+  createdAt: string;
+  validatedAt: string | null;
+  agentLaunchedAt: string | null;
+  task: string | null;
+  prNumber: number | null;
+  status: 'active' | 'orphaned' | 'merged';
+}
+
+interface WorktreeRegistry {
+  worktrees: WorktreeRegistryEntry[];
+  portPool: {
+    start: number;
+    end: number;
+    allocated: number[];
+  };
+}
+
+interface WorktreeConfig {
+  terminal: string;
+  shell: string;
+  claudeCommand: string;
+  portPool: { start: number; end: number };
+  portsPerWorktree: number;
+  worktreeBase: string;
+  defaultCopyFiles: string[];
+  defaultCopyDirs: string[];
+}
+
+// Load worktree manager config
+function loadWorktreeConfig(): WorktreeConfig {
+  const defaultConfig: WorktreeConfig = {
+    terminal: 'iterm2',
+    shell: 'zsh',
+    claudeCommand: 'claude --dangerously-skip-permissions',
+    portPool: { start: 8100, end: 8199 },
+    portsPerWorktree: 2,
+    worktreeBase: '~/tmp/worktrees',
+    defaultCopyFiles: ['.mcp.json', '.env.local', '.env.development.local', '.spellbook.yaml'],
+    defaultCopyDirs: ['.agents'],
+  };
+
+  if (!existsSync(WORKTREE_CONFIG_PATH)) {
+    return defaultConfig;
+  }
+
+  try {
+    const content = readFileSync(WORKTREE_CONFIG_PATH, 'utf-8');
+    const config = JSON.parse(content);
+    return { ...defaultConfig, ...config };
+  } catch {
+    return defaultConfig;
+  }
+}
+
+// Load or initialize the global worktree registry
+function loadWorktreeRegistry(): WorktreeRegistry {
+  const defaultRegistry: WorktreeRegistry = {
+    worktrees: [],
+    portPool: {
+      start: 8100,
+      end: 8199,
+      allocated: [],
+    },
+  };
+
+  if (!existsSync(WORKTREE_REGISTRY_PATH)) {
+    // Create the registry file
+    const registryDir = dirname(WORKTREE_REGISTRY_PATH);
+    if (!existsSync(registryDir)) {
+      mkdirSync(registryDir, { recursive: true });
+    }
+    writeFileSync(WORKTREE_REGISTRY_PATH, JSON.stringify(defaultRegistry, null, 2));
+    return defaultRegistry;
+  }
+
+  try {
+    const content = readFileSync(WORKTREE_REGISTRY_PATH, 'utf-8');
+    return JSON.parse(content);
+  } catch {
+    return defaultRegistry;
+  }
+}
+
+// Save the global worktree registry
+function saveWorktreeRegistry(registry: WorktreeRegistry): void {
+  const registryDir = dirname(WORKTREE_REGISTRY_PATH);
+  if (!existsSync(registryDir)) {
+    mkdirSync(registryDir, { recursive: true });
+  }
+  writeFileSync(WORKTREE_REGISTRY_PATH, JSON.stringify(registry, null, 2));
+}
+
+// Allocate ports from the global pool
+function allocatePorts(count: number): number[] {
+  const registry = loadWorktreeRegistry();
+  const { start, end, allocated } = registry.portPool;
+  const ports: number[] = [];
+
+  for (let port = start; port <= end && ports.length < count; port++) {
+    if (!allocated.includes(port)) {
+      // Check if port is actually in use by the system
+      try {
+        execSync(`lsof -i :${port}`, { stdio: 'pipe' });
+        // Port is in use by system, skip it
+        continue;
+      } catch {
+        // Port is free, use it
+        ports.push(port);
+      }
+    }
+  }
+
+  if (ports.length < count) {
+    throw new Error(`Could not allocate ${count} ports. Only ${ports.length} available.`);
+  }
+
+  // Update registry with allocated ports
+  registry.portPool.allocated = [...registry.portPool.allocated, ...ports].sort((a, b) => a - b);
+  saveWorktreeRegistry(registry);
+
+  return ports;
+}
+
+// Register a worktree in the global registry
+function registerWorktreeInGlobalRegistry(entry: WorktreeRegistryEntry): void {
+  const registry = loadWorktreeRegistry();
+
+  // Remove any existing entry for the same path
+  registry.worktrees = registry.worktrees.filter(w => w.worktreePath !== entry.worktreePath);
+
+  // Add new entry
+  registry.worktrees.push(entry);
+  saveWorktreeRegistry(registry);
+}
+
+// Copy directory recursively
+function copyDirRecursive(src: string, dest: string): void {
+  if (!existsSync(src)) return;
+
+  mkdirSync(dest, { recursive: true });
+
+  const entries = readdirSync(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = join(src, entry.name);
+    const destPath = join(dest, entry.name);
+
+    if (entry.isDirectory()) {
+      copyDirRecursive(srcPath, destPath);
+    } else {
+      copyFileSync(srcPath, destPath);
+    }
+  }
+}
+
+// Setup worktree with config files and symlinks
+function setupWorktree(projectPath: string, worktreePath: string, projectId: string, config: WorktreeConfig): void {
+  // Copy files
+  for (const file of config.defaultCopyFiles) {
+    const srcPath = join(projectPath, file);
+    const destPath = join(worktreePath, file);
+    if (existsSync(srcPath)) {
+      try {
+        copyFileSync(srcPath, destPath);
+        console.log(`[Worktree] Copied ${file} to worktree`);
+      } catch (err) {
+        console.warn(`[Worktree] Failed to copy ${file}:`, err);
+      }
+    }
+  }
+
+  // Copy directories
+  for (const dir of config.defaultCopyDirs) {
+    const srcPath = join(projectPath, dir);
+    const destPath = join(worktreePath, dir);
+    if (existsSync(srcPath)) {
+      try {
+        copyDirRecursive(srcPath, destPath);
+        console.log(`[Worktree] Copied ${dir}/ to worktree`);
+      } catch (err) {
+        console.warn(`[Worktree] Failed to copy ${dir}/:`, err);
+      }
+    }
+  }
+
+  // Create symlink for docs/knowledge to central Spellbook storage
+  const centralKnowledgePath = join(PROJECTS_DIR, projectId, 'knowledge');
+  const worktreeDocsPath = join(worktreePath, 'docs');
+  const worktreeKnowledgePath = join(worktreeDocsPath, 'knowledge');
+
+  if (existsSync(centralKnowledgePath)) {
+    try {
+      // Ensure docs directory exists
+      if (!existsSync(worktreeDocsPath)) {
+        mkdirSync(worktreeDocsPath, { recursive: true });
+      }
+
+      // Remove existing knowledge directory/symlink if present
+      if (existsSync(worktreeKnowledgePath)) {
+        try {
+          const stat = lstatSync(worktreeKnowledgePath);
+          if (stat.isSymbolicLink() || stat.isDirectory()) {
+            rmSync(worktreeKnowledgePath, { recursive: true, force: true });
+          }
+        } catch {
+          // Ignore removal errors
+        }
+      }
+
+      // Create symlink
+      symlinkSync(centralKnowledgePath, worktreeKnowledgePath);
+      console.log(`[Worktree] Created symlink: docs/knowledge -> ${centralKnowledgePath}`);
+    } catch (err) {
+      console.warn(`[Worktree] Failed to create knowledge symlink:`, err);
+    }
+  }
+}
+
+// Detect package manager and return install command
+function detectInstallCommand(worktreePath: string): string | null {
+  if (existsSync(join(worktreePath, 'bun.lockb'))) return 'bun install';
+  if (existsSync(join(worktreePath, 'pnpm-lock.yaml'))) return 'pnpm install';
+  if (existsSync(join(worktreePath, 'yarn.lock'))) return 'yarn install';
+  if (existsSync(join(worktreePath, 'package-lock.json'))) return 'npm install';
+  if (existsSync(join(worktreePath, 'uv.lock'))) return 'uv sync';
+  if (existsSync(join(worktreePath, 'pyproject.toml'))) return 'uv sync';
+  if (existsSync(join(worktreePath, 'requirements.txt'))) return 'pip install -r requirements.txt';
+  if (existsSync(join(worktreePath, 'go.mod'))) return 'go mod download';
+  if (existsSync(join(worktreePath, 'Cargo.toml'))) return 'cargo build';
+  return null;
+}
+
+// Generate a unique ID for worktree entries
+function generateWorktreeId(): string {
+  return `wt-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// File upload configuration
+const uploadDir = join(homedir(), '.spellbook', 'uploads');
+if (!existsSync(uploadDir)) {
+  mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (_req, file, cb) => {
+    const timestamp = Date.now();
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    cb(null, `${timestamp}-${safeName}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+});
 
 export interface BoardConfig {
   port: number;
@@ -235,13 +505,28 @@ export function createServer(config: BoardConfig) {
       const dbWorktrees = getWorktreesByProject(currentProject.id);
       const dbWorktreeMap = new Map(dbWorktrees.map(w => [w.path, w]));
 
-      // Enrich git worktrees with database info
+      // Load global registry for port info
+      const registryPath = join(homedir(), '.claude', 'worktree-registry.json');
+      let registryWorktrees: Array<{ worktreePath: string; ports: number[]; task?: string }> = [];
+      if (existsSync(registryPath)) {
+        try {
+          const registry = JSON.parse(readFileSync(registryPath, 'utf-8'));
+          registryWorktrees = registry.worktrees || [];
+        } catch {
+          // Ignore parse errors
+        }
+      }
+      const registryMap = new Map(registryWorktrees.map(w => [w.worktreePath, w]));
+
+      // Enrich git worktrees with database and registry info
       const enrichedWorktrees = worktrees.map(gitWt => {
         const dbWt = dbWorktreeMap.get(gitWt.path);
+        const regWt = registryMap.get(gitWt.path);
         return {
           ...gitWt,
-          working_on: dbWt?.working_on || null,
+          working_on: dbWt?.working_on || regWt?.task || null,
           status: dbWt?.status || 'active',
+          ports: regWt?.ports || [],
         };
       });
 
@@ -252,9 +537,9 @@ export function createServer(config: BoardConfig) {
     }
   });
 
-  // API: Create a worktree for an item
+  // API: Create a worktree for an item (full workflow)
   app.post('/api/worktree/create', async (req: Request, res: Response) => {
-    const { itemRef, branchName } = req.body;
+    const { itemRef, branchName, task, installDeps = true, launchTerminal = true } = req.body;
 
     if (!itemRef) {
       res.status(400).json({ error: 'itemRef is required (e.g., bug-44, improvement-31)' });
@@ -272,12 +557,16 @@ export function createServer(config: BoardConfig) {
       const [, type, numStr] = match;
       const number = parseInt(numStr, 10);
 
+      // Load worktree config
+      const wtConfig = loadWorktreeConfig();
+
       // Determine worktree path
       const worktreeBase = join(homedir(), 'tmp', 'worktrees', currentProject.id);
       const worktreePath = join(worktreeBase, `${type}-${number}`);
 
       // Determine branch name (use provided or generate default)
       const finalBranchName = branchName || `${type === 'bug' ? 'fix' : type}/${number}`;
+      const branchSlug = finalBranchName.replace(/\//g, '-');
 
       // Check if worktree already exists
       if (existsSync(worktreePath)) {
@@ -295,10 +584,27 @@ export function createServer(config: BoardConfig) {
         mkdirSync(parentDir, { recursive: true });
       }
 
-      // Create the worktree using git
+      // Step 1: Allocate ports from global pool
+      let allocatedPorts: number[] = [];
       try {
-        // Try creating with new branch
-        execSync(`git worktree add -b "${finalBranchName}" "${worktreePath}"`, {
+        allocatedPorts = allocatePorts(wtConfig.portsPerWorktree);
+        console.log(`[Worktree] Allocated ports: ${allocatedPorts.join(', ')}`);
+      } catch (portErr) {
+        console.warn('[Worktree] Could not allocate ports:', portErr);
+        // Continue without ports - not critical
+      }
+
+      // Step 2: Create the git worktree (always from develop branch)
+      try {
+        // Fetch latest develop first
+        try {
+          execSync('git fetch origin develop', { cwd: currentProject.path, stdio: 'pipe' });
+        } catch (fetchErr) {
+          console.warn('[Worktree] Could not fetch origin/develop:', fetchErr);
+        }
+
+        // Create new branch from develop
+        execSync(`git worktree add -b "${finalBranchName}" "${worktreePath}" origin/develop`, {
           cwd: currentProject.path,
           stdio: 'pipe',
         });
@@ -310,6 +616,13 @@ export function createServer(config: BoardConfig) {
             stdio: 'pipe',
           });
         } catch (gitErr2) {
+          // Release allocated ports on failure
+          if (allocatedPorts.length > 0) {
+            const registry = loadWorktreeRegistry();
+            registry.portPool.allocated = registry.portPool.allocated.filter(p => !allocatedPorts.includes(p));
+            saveWorktreeRegistry(registry);
+          }
+
           const errorMsg = gitErr2 instanceof Error ? gitErr2.message : String(gitErr2);
           res.status(500).json({
             error: 'Failed to create git worktree',
@@ -319,8 +632,34 @@ export function createServer(config: BoardConfig) {
         }
       }
 
-      // Import createWorktree from db if not already done
-      // Register in database
+      console.log(`[Worktree] Created git worktree at ${worktreePath}`);
+
+      // Step 3: Copy config files and create symlinks
+      setupWorktree(currentProject.path, worktreePath, currentProject.id, wtConfig);
+
+      // Step 4: Install dependencies (if requested)
+      let installError = '';
+      if (installDeps) {
+        const installCmd = detectInstallCommand(worktreePath);
+        if (installCmd) {
+          console.log(`[Worktree] Running: ${installCmd}`);
+          try {
+            execSync(installCmd, {
+              cwd: worktreePath,
+              encoding: 'utf-8',
+              timeout: 300000, // 5 minute timeout
+              stdio: 'pipe',
+            });
+            console.log(`[Worktree] Dependencies installed successfully`);
+          } catch (installErr) {
+            installError = installErr instanceof Error ? installErr.message : String(installErr);
+            console.warn(`[Worktree] Dependency installation failed:`, installError);
+            // Continue - deps can be installed manually
+          }
+        }
+      }
+
+      // Step 5: Register in Spellbook database
       const { createWorktree: dbCreateWorktree } = await import('../db/index.js');
       dbCreateWorktree({
         project_id: currentProject.id,
@@ -330,19 +669,612 @@ export function createServer(config: BoardConfig) {
         status: 'active',
       });
 
+      // Step 6: Register in global worktree registry
+      const registryEntry: WorktreeRegistryEntry = {
+        id: generateWorktreeId(),
+        project: currentProject.id,
+        repoPath: currentProject.path,
+        branch: finalBranchName,
+        branchSlug,
+        worktreePath,
+        ports: allocatedPorts,
+        createdAt: new Date().toISOString(),
+        validatedAt: null,
+        agentLaunchedAt: null,
+        task: task || null,
+        prNumber: null,
+        status: 'active',
+      };
+      registerWorktreeInGlobalRegistry(registryEntry);
+
+      console.log(`[Worktree] Registered in global registry: ${itemRef}`);
+
+      // Step 7: Launch terminal with Claude agent (if requested)
+      let terminalLaunched = false;
+      let terminalInfo = null;
+
+      if (launchTerminal) {
+        const launchScript = join(homedir(), '.claude', 'skills', 'worktree-manager', 'scripts', 'launch-agent.sh');
+
+        if (existsSync(launchScript)) {
+          try {
+            execSync(`"${launchScript}" "${worktreePath}" "${task || ''}"`, {
+              cwd: worktreePath,
+              stdio: 'pipe',
+              timeout: 10000,
+            });
+            terminalLaunched = true;
+            console.log(`[Worktree] Launched agent via launch-agent.sh`);
+
+            // Update registry with launch time
+            const registry = loadWorktreeRegistry();
+            const entry = registry.worktrees.find(w => w.worktreePath === worktreePath);
+            if (entry) {
+              entry.agentLaunchedAt = new Date().toISOString();
+              saveWorktreeRegistry(registry);
+            }
+          } catch (launchErr) {
+            console.warn(`[Worktree] Failed to launch via script:`, launchErr);
+            // Try manual terminal launch fallback
+            try {
+              const terminal = wtConfig.terminal || 'iterm2';
+              const claudeCmd = wtConfig.claudeCommand || 'claude --dangerously-skip-permissions';
+
+              if (terminal === 'iterm2') {
+                execSync(`osascript -e 'tell application "iTerm2" to activate' -e 'tell application "iTerm2" to create window with default profile' -e 'tell application "iTerm2" to tell current session of current window to write text "cd \\"${worktreePath}\\" && ${claudeCmd}"'`, {
+                  stdio: 'pipe',
+                });
+                terminalLaunched = true;
+              } else if (terminal === 'ghostty') {
+                execSync(`open -na "Ghostty.app" --args -e bash -c "cd '${worktreePath}' && ${claudeCmd}; exec bash"`, {
+                  stdio: 'pipe',
+                });
+                terminalLaunched = true;
+              }
+            } catch (fallbackErr) {
+              console.warn(`[Worktree] Terminal launch fallback failed:`, fallbackErr);
+            }
+          }
+        } else {
+          // No launch script, try direct terminal launch
+          try {
+            const terminal = wtConfig.terminal || 'iterm2';
+            const claudeCmd = wtConfig.claudeCommand || 'claude --dangerously-skip-permissions';
+
+            if (terminal === 'iterm2') {
+              execSync(`osascript -e 'tell application "iTerm2" to activate' -e 'tell application "iTerm2" to create window with default profile' -e 'tell application "iTerm2" to tell current session of current window to write text "cd \\"${worktreePath}\\" && ${claudeCmd}"'`, {
+                stdio: 'pipe',
+              });
+              terminalLaunched = true;
+            } else if (terminal === 'ghostty') {
+              execSync(`open -na "Ghostty.app" --args -e bash -c "cd '${worktreePath}' && ${claudeCmd}; exec bash"`, {
+                stdio: 'pipe',
+              });
+              terminalLaunched = true;
+            }
+          } catch (termErr) {
+            console.warn(`[Worktree] Could not launch terminal:`, termErr);
+          }
+        }
+
+        terminalInfo = {
+          launched: terminalLaunched,
+          terminal: wtConfig.terminal,
+          command: wtConfig.claudeCommand,
+        };
+      }
+
       console.log(`[Server] Created worktree for ${itemRef} at ${worktreePath}`);
 
       res.status(201).json({
         success: true,
         path: worktreePath,
         branch: finalBranchName,
+        branchSlug,
         workingOn: itemRef,
+        ports: allocatedPorts,
+        setup: {
+          configFilesCopied: wtConfig.defaultCopyFiles,
+          directoriesCopied: wtConfig.defaultCopyDirs,
+          knowledgeSymlinked: existsSync(join(worktreePath, 'docs', 'knowledge')),
+        },
+        dependencies: {
+          installed: installDeps && !installError,
+          error: installError || null,
+        },
+        terminal: terminalInfo,
+        registryEntry,
       });
     } catch (err) {
       console.error('Failed to create worktree:', err);
       res.status(500).json({
         error: 'Failed to create worktree',
         details: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // API: Close/remove a worktree
+  app.delete('/api/worktrees/:path(*)', async (req: Request, res: Response) => {
+    const worktreePath = '/' + req.params.path;
+
+    if (!worktreePath || worktreePath === '/') {
+      res.status(400).json({ error: 'Worktree path is required' });
+      return;
+    }
+
+    try {
+      // Verify this is a valid worktree for the current project
+      const dbWorktrees = getWorktreesByProject(currentProject.id);
+      const worktree = dbWorktrees.find(w => w.path === worktreePath);
+
+      // Also verify it's not the main repository
+      if (worktreePath === currentProject.path) {
+        res.status(400).json({ error: 'Cannot remove the main repository' });
+        return;
+      }
+
+      // Step 0: Kill associated iTerm sessions
+      // Find the working_on item (e.g., "bug-79") and close matching iTerm tabs
+      if (worktree?.working_on) {
+        try {
+          const itemRef = worktree.working_on;
+          const closeItermScript = `
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  try
+                    set sess to current session of t
+                    set sessName to name of sess
+                    if sessName contains "${itemRef}" or sessName contains "${itemRef.replace('-', ' ')}" then
+                      close t
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end tell
+          `;
+          execSync(`osascript -e '${closeItermScript.replace(/'/g, "'\"'\"'")}'`, {
+            timeout: 5000,
+            stdio: 'pipe',
+          });
+          console.log(`[Server] Closed iTerm session for: ${itemRef}`);
+        } catch (itermErr) {
+          console.warn('[Server] Could not close iTerm session:', itermErr);
+        }
+      }
+
+      // Step 1: Kill any processes on ports associated with this worktree
+      // Try to find and kill processes in the worktree directory
+      try {
+        // Find node processes running from this directory
+        const psOutput = execSync('ps aux', { encoding: 'utf-8' });
+        const lines = psOutput.split('\n').filter(line => line.includes(worktreePath));
+        for (const line of lines) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length > 1) {
+            const pid = parts[1];
+            try {
+              execSync(`kill -9 ${pid}`, { stdio: 'pipe' });
+              console.log(`[Server] Killed process ${pid} for worktree ${worktreePath}`);
+            } catch {
+              // Process might already be dead
+            }
+          }
+        }
+      } catch {
+        // Ignore ps/kill errors
+      }
+
+      // Step 2: Remove the git worktree
+      try {
+        execSync(`git worktree remove "${worktreePath}" --force`, {
+          cwd: currentProject.path,
+          stdio: 'pipe',
+        });
+        console.log(`[Server] Removed git worktree: ${worktreePath}`);
+      } catch (gitErr) {
+        // If git worktree remove fails, try manual removal
+        console.warn('[Server] git worktree remove failed, trying manual cleanup:', gitErr);
+        try {
+          // Remove the directory
+          if (existsSync(worktreePath)) {
+            execSync(`rm -rf "${worktreePath}"`, { stdio: 'pipe' });
+          }
+          // Prune the worktree list
+          execSync('git worktree prune', {
+            cwd: currentProject.path,
+            stdio: 'pipe',
+          });
+        } catch (manualErr) {
+          console.error('[Server] Manual cleanup failed:', manualErr);
+        }
+      }
+
+      // Step 3: Update database status to 'abandoned'
+      if (worktree) {
+        try {
+          updateWorktree(worktreePath, { status: 'abandoned' });
+          console.log(`[Server] Updated worktree status to abandoned: ${worktreePath}`);
+        } catch (dbErr) {
+          console.warn('[Server] Failed to update worktree in database:', dbErr);
+        }
+      }
+
+      // Step 4: Clean up global worktree registry if it exists
+      const registryPath = join(homedir(), '.claude', 'worktree-registry.json');
+      if (existsSync(registryPath)) {
+        try {
+          const registry = JSON.parse(readFileSync(registryPath, 'utf-8'));
+          if (registry.worktrees && Array.isArray(registry.worktrees)) {
+            // Find and remove the worktree entry
+            const entryIndex = registry.worktrees.findIndex((w: any) => w.worktreePath === worktreePath);
+            if (entryIndex !== -1) {
+              const entry = registry.worktrees[entryIndex];
+              // Release ports
+              if (entry.ports && registry.portPool?.allocated) {
+                registry.portPool.allocated = registry.portPool.allocated.filter(
+                  (p: number) => !entry.ports.includes(p)
+                );
+              }
+              // Remove entry
+              registry.worktrees.splice(entryIndex, 1);
+              writeFileSync(registryPath, JSON.stringify(registry, null, 2));
+              console.log(`[Server] Removed from global registry: ${worktreePath}`);
+            }
+          }
+        } catch (regErr) {
+          console.warn('[Server] Failed to update global registry:', regErr);
+        }
+      }
+
+      res.json({
+        success: true,
+        path: worktreePath,
+        message: 'Worktree closed and cleaned up',
+      });
+    } catch (err) {
+      console.error('Failed to close worktree:', err);
+      res.status(500).json({
+        error: 'Failed to close worktree',
+        details: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // API: Get git sync status (ahead/behind origin)
+  app.get('/api/git/sync-status', (req: Request, res: Response) => {
+    const targetPath = (req.query.path as string) || currentProject.path;
+    const branch = (req.query.branch as string) || 'develop';
+
+    try {
+      // First, fetch from origin to get latest refs
+      try {
+        execSync(`git fetch origin ${branch}`, {
+          cwd: targetPath,
+          encoding: 'utf-8',
+          timeout: 30000,
+          stdio: 'pipe',
+        });
+      } catch (fetchErr) {
+        // Fetch might fail if offline or remote unavailable - continue with stale data
+        console.warn('[Server] git fetch failed, using cached refs:', fetchErr instanceof Error ? fetchErr.message : fetchErr);
+      }
+
+      // Get ahead/behind counts
+      const revListOutput = execSync(`git rev-list --left-right --count origin/${branch}...${branch}`, {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      }).trim();
+
+      const [behind, ahead] = revListOutput.split('\t').map(n => parseInt(n, 10) || 0);
+
+      // Get current branch to confirm
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      }).trim();
+
+      res.json({
+        branch: currentBranch,
+        trackedBranch: branch,
+        ahead,
+        behind,
+        lastFetch: new Date().toISOString(),
+        synced: ahead === 0 && behind === 0,
+      });
+    } catch (err) {
+      console.error('Failed to get git sync status:', err);
+      res.json({
+        branch: 'unknown',
+        trackedBranch: branch,
+        ahead: 0,
+        behind: 0,
+        lastFetch: null,
+        synced: false,
+        error: err instanceof Error ? err.message : 'Failed to get sync status',
+      });
+    }
+  });
+
+  // API: Get uncommitted changes (modified, staged, untracked files)
+  app.get('/api/git/uncommitted', (req: Request, res: Response) => {
+    const targetPath = (req.query.path as string) || currentProject.path;
+
+    try {
+      const statusOutput = execSync('git status --porcelain', {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      });
+
+      const files: Array<{ path: string; status: string; statusCode: string }> = [];
+
+      if (statusOutput.trim()) {
+        const lines = statusOutput.trim().split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const statusCode = line.substring(0, 2);
+          const filePath = line.substring(3);
+
+          let status = 'modified';
+          if (statusCode.includes('A')) status = 'added';
+          else if (statusCode.includes('D')) status = 'deleted';
+          else if (statusCode.includes('R')) status = 'renamed';
+          else if (statusCode.includes('?')) status = 'untracked';
+          else if (statusCode.includes('U')) status = 'conflict';
+
+          files.push({ path: filePath, status, statusCode: statusCode.trim() });
+        }
+      }
+
+      const hasUncommitted = files.length > 0;
+      const modifiedCount = files.filter(f => f.status === 'modified').length;
+      const stagedCount = files.filter(f => f.statusCode[0] !== ' ' && f.statusCode[0] !== '?').length;
+      const untrackedCount = files.filter(f => f.status === 'untracked').length;
+
+      res.json({
+        hasUncommitted,
+        count: files.length,
+        modifiedCount,
+        stagedCount,
+        untrackedCount,
+        files,
+      });
+    } catch (err) {
+      console.error('Failed to get uncommitted changes:', err);
+      res.json({
+        hasUncommitted: false,
+        count: 0,
+        modifiedCount: 0,
+        stagedCount: 0,
+        untrackedCount: 0,
+        files: [],
+        error: err instanceof Error ? err.message : 'Failed to get uncommitted changes',
+      });
+    }
+  });
+
+  // API: Get comparison between develop and main
+  app.get('/api/git/main-comparison', (req: Request, res: Response) => {
+    const targetPath = (req.query.path as string) || currentProject.path;
+
+    try {
+      // First fetch both branches to get latest refs
+      try {
+        execSync('git fetch origin main develop', {
+          cwd: targetPath,
+          encoding: 'utf-8',
+          timeout: 30000,
+          stdio: 'pipe',
+        });
+      } catch (fetchErr) {
+        console.warn('[Server] git fetch for main/develop failed, using cached refs');
+      }
+
+      // Get current branch
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      }).trim();
+
+      // Get commits that develop has that main doesn't (develop ahead of main)
+      let developAheadOfMain = 0;
+      try {
+        const aheadOutput = execSync('git rev-list --count origin/main..HEAD', {
+          cwd: targetPath,
+          encoding: 'utf-8',
+        }).trim();
+        developAheadOfMain = parseInt(aheadOutput, 10) || 0;
+      } catch {
+        developAheadOfMain = 0;
+      }
+
+      // Get commits that main has that develop doesn't (develop behind main)
+      let developBehindMain = 0;
+      try {
+        const behindOutput = execSync('git rev-list --count HEAD..origin/main', {
+          cwd: targetPath,
+          encoding: 'utf-8',
+        }).trim();
+        developBehindMain = parseInt(behindOutput, 10) || 0;
+      } catch {
+        developBehindMain = 0;
+      }
+
+      // Determine sync status
+      const synced = developAheadOfMain === 0 && developBehindMain === 0;
+      const needsPull = developBehindMain > 0;
+      const needsPush = developAheadOfMain > 0 && developBehindMain === 0;
+
+      res.json({
+        currentBranch,
+        developAheadOfMain,
+        developBehindMain,
+        synced,
+        needsPull,
+        needsPush,
+        lastCheck: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('Failed to get main comparison:', err);
+      res.json({
+        currentBranch: 'unknown',
+        developAheadOfMain: 0,
+        developBehindMain: 0,
+        synced: false,
+        needsPull: false,
+        needsPush: false,
+        error: err instanceof Error ? err.message : 'Failed to compare with main',
+      });
+    }
+  });
+
+  // API: Pull from origin
+  app.post('/api/git/pull', (req: Request, res: Response) => {
+    const targetPath = (req.query.path as string) || currentProject.path;
+    const branch = (req.body.branch as string) || 'develop';
+
+    try {
+      // Run git pull
+      const output = execSync(`git pull origin ${branch}`, {
+        cwd: targetPath,
+        encoding: 'utf-8',
+        timeout: 60000,
+      });
+
+      // Get new sync status after pull
+      const revListOutput = execSync(`git rev-list --left-right --count origin/${branch}...${branch}`, {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      }).trim();
+
+      const [behind, ahead] = revListOutput.split('\t').map(n => parseInt(n, 10) || 0);
+
+      res.json({
+        success: true,
+        message: output.trim() || 'Already up to date',
+        ahead,
+        behind,
+        synced: ahead === 0 && behind === 0,
+      });
+    } catch (err) {
+      console.error('Failed to pull:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Failed to pull';
+
+      // Check for common issues
+      let hint = '';
+      if (errorMessage.includes('uncommitted changes')) {
+        hint = 'You have uncommitted changes. Commit or stash them first.';
+      } else if (errorMessage.includes('CONFLICT')) {
+        hint = 'Merge conflict detected. Resolve conflicts manually.';
+      }
+
+      res.status(500).json({
+        success: false,
+        error: errorMessage,
+        hint,
+      });
+    }
+  });
+
+  // API: Pull main into develop (fetch origin/main and merge)
+  app.post('/api/git/pull-main', (req: Request, res: Response) => {
+    const targetPath = (req.query.path as string) || currentProject.path;
+
+    try {
+      // Check current branch
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      }).trim();
+
+      if (currentBranch !== 'develop') {
+        res.status(400).json({
+          success: false,
+          error: `Not on develop branch (currently on ${currentBranch})`,
+          hint: 'Switch to develop branch before pulling main.',
+        });
+        return;
+      }
+
+      // Check for uncommitted changes
+      const statusOutput = execSync('git status --porcelain', {
+        cwd: targetPath,
+        encoding: 'utf-8',
+      }).trim();
+
+      if (statusOutput) {
+        res.status(400).json({
+          success: false,
+          error: 'Uncommitted changes detected',
+          hint: 'Commit or stash your changes before pulling main.',
+        });
+        return;
+      }
+
+      // Fetch origin/main
+      try {
+        execSync('git fetch origin main', {
+          cwd: targetPath,
+          encoding: 'utf-8',
+          timeout: 30000,
+          stdio: 'pipe',
+        });
+      } catch (fetchErr) {
+        console.error('Failed to fetch origin/main:', fetchErr);
+        res.status(500).json({
+          success: false,
+          error: 'Failed to fetch origin/main',
+          hint: 'Check your network connection or if the main branch exists on origin.',
+        });
+        return;
+      }
+
+      // Merge origin/main into develop
+      let mergeOutput: string;
+      try {
+        mergeOutput = execSync('git merge origin/main --no-edit', {
+          cwd: targetPath,
+          encoding: 'utf-8',
+          timeout: 60000,
+        });
+      } catch (mergeErr) {
+        // Check if it's a merge conflict
+        const mergeStatus = execSync('git status --porcelain', {
+          cwd: targetPath,
+          encoding: 'utf-8',
+        }).trim();
+
+        if (mergeStatus.includes('UU') || mergeStatus.includes('AA') || mergeStatus.includes('DD')) {
+          // Abort the merge to leave repo in clean state
+          try {
+            execSync('git merge --abort', { cwd: targetPath, encoding: 'utf-8' });
+          } catch {
+            // Ignore abort errors
+          }
+          res.status(500).json({
+            success: false,
+            error: 'Merge conflict detected',
+            hint: 'Resolve conflicts manually: git merge origin/main',
+          });
+          return;
+        }
+
+        throw mergeErr;
+      }
+
+      res.json({
+        success: true,
+        message: mergeOutput.trim() || 'Already up to date',
+      });
+    } catch (err) {
+      console.error('Failed to pull main into develop:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Failed to pull main';
+
+      res.status(500).json({
+        success: false,
+        error: errorMessage,
+        hint: 'Check the server logs for more details.',
       });
     }
   });
@@ -464,71 +1396,191 @@ export function createServer(config: BoardConfig) {
     }
   });
 
-  // API: Get knowledge base files from PROJECT docs folder (git-tracked)
+  // API: Get knowledge base as tree structure from ~/.spellbook/projects/{project_id}/knowledge/
   app.get('/api/knowledge', (_req: Request, res: Response) => {
-    // Use project docs folder for knowledge base (git-tracked, shared with team)
-    const knowledgePath = join(currentProject.path, 'docs', 'knowledge');
-    const templatesPath = join(currentProject.path, 'docs', 'knowledge', 'templates');
-    const files: Array<{ name: string; path: string; type: string; category?: string }> = [];
+    // Knowledge base is stored in central Spellbook storage
+    const knowledgePath = join(PROJECTS_DIR, currentProject.id, 'knowledge');
 
-    // Scan knowledge/ directory
-    function scanDirectory(dirPath: string, category?: string) {
-      if (!existsSync(dirPath)) return;
+    interface TreeNode {
+      type: 'folder' | 'file';
+      name: string;
+      path: string;
+      children?: TreeNode[];
+      lastModified?: string;
+    }
+
+    function buildTree(dirPath: string, relativePath: string = ''): TreeNode[] {
+      if (!existsSync(dirPath)) return [];
 
       const entries = readdirSync(dirPath, { withFileTypes: true });
+      const nodes: TreeNode[] = [];
+
       for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue;
+
         const fullPath = join(dirPath, entry.name);
+        const relPath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+
         if (entry.isDirectory()) {
-          // Skip templates folder here - it's scanned separately below
-          if (entry.name === 'templates') continue;
-          // Recurse into subdirectories (architecture, guides, operations, etc.)
-          scanDirectory(fullPath, entry.name);
+          const children = buildTree(fullPath, relPath);
+          nodes.push({
+            type: 'folder',
+            name: entry.name,
+            path: relPath,
+            children,
+          });
         } else if (entry.isFile() && entry.name.endsWith('.md')) {
-          const name = entry.name.replace('.md', '').replace(/-/g, ' ').replace(/_/g, ' ');
-          const relativePath = fullPath.replace(join(currentProject.path, 'docs') + '/', '');
-          files.push({
-            name: name.toUpperCase(),
-            path: `docs/${relativePath}`,
-            type: 'doc',
-            category: category || 'general',
+          const stat = statSync(fullPath);
+          nodes.push({
+            type: 'file',
+            name: entry.name.replace('.md', ''),
+            path: relPath,
+            lastModified: stat.mtime.toISOString(),
           });
         }
       }
+
+      // Sort: folders first, then alphabetically
+      return nodes.sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
     }
 
     try {
-      // Scan knowledge folder
-      scanDirectory(knowledgePath);
-
-      // Also scan templates folder
-      if (existsSync(templatesPath)) {
-        const templateEntries = readdirSync(templatesPath, { withFileTypes: true });
-        for (const entry of templateEntries) {
-          if (entry.isFile() && entry.name.endsWith('.md')) {
-            const name = entry.name.replace('.md', '').replace(/-/g, ' ').replace(/_/g, ' ');
-            files.push({
-              name: name.toUpperCase(),
-              path: `docs/knowledge/templates/${entry.name}`,
-              type: 'doc',
-              category: 'templates',
-            });
-          }
+      // Create knowledge directory if it doesn't exist with default structure
+      if (!existsSync(knowledgePath)) {
+        mkdirSync(knowledgePath, { recursive: true });
+        // Create default subdirectories
+        const defaultDirs = ['architecture', 'decisions', 'guides', 'api', 'research'];
+        for (const dir of defaultDirs) {
+          mkdirSync(join(knowledgePath, dir), { recursive: true });
         }
       }
 
-      // Sort by category then name
-      files.sort((a, b) => {
-        if (a.category === b.category) return a.name.localeCompare(b.name);
-        return a.category!.localeCompare(b.category!);
+      const tree = buildTree(knowledgePath);
+
+      // Count total files
+      function countFiles(nodes: TreeNode[]): number {
+        let count = 0;
+        for (const node of nodes) {
+          if (node.type === 'file') count++;
+          if (node.children) count += countFiles(node.children);
+        }
+        return count;
+      }
+
+      // Count folders (categories)
+      function countFolders(nodes: TreeNode[]): number {
+        let count = 0;
+        for (const node of nodes) {
+          if (node.type === 'folder') {
+            count++;
+            if (node.children) count += countFolders(node.children);
+          }
+        }
+        return count;
+      }
+
+      res.json({
+        tree,
+        root: `~/.spellbook/projects/${currentProject.id}/knowledge`,
+        stats: {
+          totalDocs: countFiles(tree),
+          totalCategories: countFolders(tree),
+        },
       });
-      res.json({ files });
     } catch (err) {
       console.error('Failed to read knowledge base:', err);
-      res.json({ files: [], error: 'Failed to read knowledge base' });
+      res.json({ tree: [], root: '', stats: { totalDocs: 0, totalCategories: 0 }, error: 'Failed to read knowledge base' });
     }
   });
 
-  // API: Get specific knowledge doc content from PROJECT docs folder
+  // API: Get knowledge document content
+  app.get('/api/knowledge/content', (req: Request, res: Response) => {
+    const docPath = req.query.path as string;
+    if (!docPath) {
+      res.status(400).json({ error: 'path is required' });
+      return;
+    }
+
+    // Security: ensure path is within knowledge directory
+    const knowledgePath = join(PROJECTS_DIR, currentProject.id, 'knowledge');
+    const fullPath = join(knowledgePath, docPath);
+
+    if (!fullPath.startsWith(knowledgePath)) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    // Add .md extension if not present
+    const finalPath = fullPath.endsWith('.md') ? fullPath : `${fullPath}.md`;
+
+    if (!existsSync(finalPath)) {
+      res.status(404).json({ error: 'Document not found', path: docPath });
+      return;
+    }
+
+    try {
+      const content = readFileSync(finalPath, 'utf-8');
+      const stat = statSync(finalPath);
+      res.json({
+        content,
+        path: docPath,
+        lastModified: stat.mtime.toISOString(),
+      });
+    } catch (err) {
+      console.error('Failed to read document:', err);
+      res.status(500).json({ error: 'Failed to read document' });
+    }
+  });
+
+  // API: Update knowledge document content
+  app.put('/api/knowledge/content', (req: Request, res: Response) => {
+    const { path: docPath, content } = req.body;
+
+    if (!docPath) {
+      res.status(400).json({ error: 'path is required' });
+      return;
+    }
+
+    if (content === undefined) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+
+    // Security: ensure path is within knowledge directory
+    const knowledgePath = join(PROJECTS_DIR, currentProject.id, 'knowledge');
+    const fullPath = join(knowledgePath, docPath);
+
+    if (!fullPath.startsWith(knowledgePath)) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    // Add .md extension if not present
+    const finalPath = fullPath.endsWith('.md') ? fullPath : `${fullPath}.md`;
+
+    try {
+      // Ensure parent directory exists
+      const parentDir = dirname(finalPath);
+      if (!existsSync(parentDir)) {
+        mkdirSync(parentDir, { recursive: true });
+      }
+
+      writeFileSync(finalPath, content, 'utf-8');
+
+      // Auto-commit to git
+      debouncedSync(currentProject.id, `Updated knowledge doc: ${docPath}`);
+
+      res.json({ success: true, path: docPath });
+    } catch (err) {
+      console.error('Failed to save document:', err);
+      res.status(500).json({ error: 'Failed to save document' });
+    }
+  });
+
+  // API: Get specific knowledge doc content from Spellbook knowledge folder
   app.get('/api/knowledge/doc', (req: Request, res: Response) => {
     const docPath = req.query.path as string;
     if (!docPath) {
@@ -536,8 +1588,9 @@ export function createServer(config: BoardConfig) {
       return;
     }
 
-    // Read from project docs folder
-    const fullPath = join(currentProject.path, docPath);
+    // Read from Spellbook knowledge folder (matches the tree source)
+    const knowledgePath = join(PROJECTS_DIR, currentProject.id, 'knowledge');
+    const fullPath = join(knowledgePath, docPath);
     try {
       if (existsSync(fullPath)) {
         const content = readFileSync(fullPath, 'utf-8');
@@ -675,6 +1728,68 @@ export function createServer(config: BoardConfig) {
     };
 
     res.json(response);
+  });
+
+  // API: Get workflow state (for tracking planning → implementing flow)
+  app.get('/api/workflow-state', (_req: Request, res: Response) => {
+    const stateFile = join(currentProject.path, '.claude', 'state', 'workflow.json');
+
+    try {
+      if (existsSync(stateFile)) {
+        const state = JSON.parse(readFileSync(stateFile, 'utf-8'));
+        res.json(state);
+      } else {
+        res.json({ ref: null, status: null });
+      }
+    } catch (err) {
+      console.error('Failed to read workflow state:', err);
+      res.json({ ref: null, status: null });
+    }
+  });
+
+  // API: Set workflow state (called when user starts "Work on this")
+  app.post('/api/workflow-state', (req: Request, res: Response) => {
+    const { ref, status, itemType, itemNumber } = req.body;
+    const stateDir = join(currentProject.path, '.claude', 'state');
+    const stateFile = join(stateDir, 'workflow.json');
+
+    try {
+      // Ensure directory exists
+      if (!existsSync(stateDir)) {
+        mkdirSync(stateDir, { recursive: true });
+      }
+
+      const state = {
+        ref,
+        status,
+        itemType,
+        itemNumber,
+        startedAt: new Date().toISOString(),
+        projectPath: currentProject.path,
+      };
+
+      writeFileSync(stateFile, JSON.stringify(state, null, 2));
+      console.log(`[Server] Workflow state set: ${ref} → ${status}`);
+      res.json({ success: true, state });
+    } catch (err) {
+      console.error('Failed to write workflow state:', err);
+      res.status(500).json({ error: 'Failed to write workflow state' });
+    }
+  });
+
+  // API: Clear workflow state (called when work is complete)
+  app.delete('/api/workflow-state', (_req: Request, res: Response) => {
+    const stateFile = join(currentProject.path, '.claude', 'state', 'workflow.json');
+
+    try {
+      if (existsSync(stateFile)) {
+        unlinkSync(stateFile);
+      }
+      res.json({ success: true });
+    } catch (err) {
+      console.error('Failed to clear workflow state:', err);
+      res.status(500).json({ error: 'Failed to clear workflow state' });
+    }
   });
 
   // API: Get dashboard stats
@@ -1406,7 +2521,7 @@ export function createServer(config: BoardConfig) {
 
   // API: Create a new terminal
   app.post('/api/terminals', (req: Request, res: Response) => {
-    const { cwd, name, command, args } = req.body as CreateTerminalOptions & { command?: string; args?: string[] };
+    const { cwd, name, command, args, useTmux, tmuxSessionName } = req.body as CreateTerminalOptions & { command?: string; args?: string[] };
 
     // Default to project path if no cwd provided
     const targetCwd = cwd || currentProject.path;
@@ -1431,6 +2546,8 @@ export function createServer(config: BoardConfig) {
         command,
         args,
         env: projectEnv.env, // Pass project env vars to terminal
+        useTmux: useTmux !== false, // Default to true (use tmux if available)
+        tmuxSessionName,
       });
 
       res.status(201).json({
@@ -1438,10 +2555,82 @@ export function createServer(config: BoardConfig) {
         name: terminal.name,
         cwd: terminal.cwd,
         pid: terminal.pid,
+        tmuxSession: terminal.tmuxSession,
       });
     } catch (err) {
       console.error('Failed to create terminal:', err);
       res.status(500).json({ error: 'Failed to create terminal' });
+    }
+  });
+
+  // API: List persisted tmux sessions (for reconnection)
+  // NOTE: This route MUST be defined BEFORE /api/terminals/:id to avoid matching "persisted" as an :id
+  app.get('/api/terminals/persisted', (_req: Request, res: Response) => {
+    try {
+      const tmuxAvailable = terminalManager.isTmuxAvailable();
+      if (!tmuxAvailable) {
+        res.json({
+          available: false,
+          sessions: [],
+          message: 'tmux not available on this system',
+        });
+        return;
+      }
+
+      const sessions = terminalManager.listTmuxSessions();
+      res.json({
+        available: true,
+        sessions,
+      });
+    } catch (err) {
+      console.error('Failed to list persisted sessions:', err);
+      res.status(500).json({ error: 'Failed to list persisted sessions' });
+    }
+  });
+
+  // API: Reconnect to a persisted tmux session
+  // NOTE: This route MUST be defined BEFORE /api/terminals/:id to avoid matching "reconnect" as an :id
+  app.post('/api/terminals/reconnect', (req: Request, res: Response) => {
+    const { sessionName, cwd } = req.body;
+
+    if (!sessionName) {
+      res.status(400).json({ error: 'sessionName is required' });
+      return;
+    }
+
+    // Default to project path if no cwd provided
+    const targetCwd = cwd || currentProject.path;
+
+    if (!existsSync(targetCwd)) {
+      res.status(400).json({ error: `Directory does not exist: ${targetCwd}` });
+      return;
+    }
+
+    try {
+      // Load project environment variables
+      const projectEnv = loadProjectEnv(currentProject.path);
+
+      const terminal = terminalManager.reconnect(sessionName, targetCwd, projectEnv.env);
+
+      if (!terminal) {
+        res.status(404).json({
+          error: 'Session not found or cannot reconnect',
+          sessionName,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        terminalId: terminal.id,
+        name: terminal.name,
+        cwd: terminal.cwd,
+        pid: terminal.pid,
+        tmuxSession: terminal.tmuxSession,
+        reconnected: true,
+      });
+    } catch (err) {
+      console.error('Failed to reconnect to session:', err);
+      res.status(500).json({ error: 'Failed to reconnect to session' });
     }
   });
 
@@ -1489,14 +2678,55 @@ export function createServer(config: BoardConfig) {
   // API: Close terminal
   app.delete('/api/terminals/:id', (req: Request, res: Response) => {
     const terminalId = req.params.id as string;
+
+    console.log(`[Server] DELETE /api/terminals/${terminalId} - closing terminal`);
+
+    // Get terminal info before closing for response
+    const terminal = terminalManager.get(terminalId);
+    const tmuxSession = terminal?.tmuxSession;
+
     const success = terminalManager.close(terminalId);
 
     if (!success) {
+      console.log(`[Server] Terminal ${terminalId} not found`);
       res.status(404).json({ error: 'Terminal not found' });
       return;
     }
 
-    res.json({ success: true });
+    console.log(`[Server] Terminal ${terminalId} closed successfully`);
+    res.json({
+      success: true,
+      terminalId,
+      tmuxSessionKilled: tmuxSession || null,
+    });
+  });
+
+  // API: Kill tmux session directly (fallback for when terminal close fails)
+  app.post('/api/terminals/kill-tmux', (req: Request, res: Response) => {
+    const { sessionName } = req.body;
+
+    if (!sessionName) {
+      res.status(400).json({ error: 'sessionName is required' });
+      return;
+    }
+
+    console.log(`[Server] POST /api/terminals/kill-tmux - killing tmux session: ${sessionName}`);
+
+    try {
+      terminalManager.killTmuxSession(sessionName);
+      console.log(`[Server] tmux session ${sessionName} killed successfully`);
+      res.json({
+        success: true,
+        sessionName,
+        message: `tmux session ${sessionName} killed`,
+      });
+    } catch (error) {
+      console.error(`[Server] Failed to kill tmux session ${sessionName}:`, error);
+      res.status(500).json({
+        error: 'Failed to kill tmux session',
+        details: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
   });
 
   // API: Write to terminal (for non-WebSocket usage)
@@ -1538,6 +2768,303 @@ export function createServer(config: BoardConfig) {
 
     res.json({ success: true });
   });
+
+  // API: Get recent terminal output for preview
+  app.get('/api/terminals/:id/preview', (req: Request, res: Response) => {
+    const terminalId = req.params.id as string;
+    const maxLines = parseInt(req.query.lines as string) || 5;
+
+    const lines = terminalManager.getRecentOutput(terminalId, maxLines);
+
+    if (lines.length === 0) {
+      // Could be a valid terminal with no output yet, or terminal not found
+      const terminal = terminalManager.get(terminalId);
+      if (!terminal) {
+        res.status(404).json({ error: 'Terminal not found' });
+        return;
+      }
+    }
+
+    res.json({
+      terminalId,
+      lines,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // API: Detach from terminal (preserve tmux session for later reconnect)
+  app.post('/api/terminals/:id/detach', (req: Request, res: Response) => {
+    const terminalId = req.params.id as string;
+    const terminal = terminalManager.get(terminalId);
+
+    if (!terminal) {
+      res.status(404).json({ error: 'Terminal not found' });
+      return;
+    }
+
+    if (!terminal.tmuxSession) {
+      res.status(400).json({
+        error: 'Terminal does not have a tmux session, cannot detach',
+        hint: 'Use DELETE /api/terminals/:id to close instead',
+      });
+      return;
+    }
+
+    const success = terminalManager.detach(terminalId);
+
+    if (!success) {
+      res.status(500).json({ error: 'Failed to detach terminal' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      tmuxSession: terminal.tmuxSession,
+      message: 'Terminal detached. tmux session preserved for reconnection.',
+    });
+  });
+
+  // ============================================
+  // iTerm2 Integration APIs
+  // ============================================
+
+  // API: Open or focus iTerm tab
+  app.post('/api/iterm/open', (req: Request, res: Response) => {
+    const { sessionName, workingDir, command, tty } = req.body;
+
+    if (!sessionName) {
+      res.status(400).json({ error: 'sessionName is required' });
+      return;
+    }
+
+    const dir = workingDir || currentProject.path;
+    const cmd = command || 'claude --dangerously-skip-permissions';
+
+    try {
+      // If TTY is provided, try to focus by TTY first (more reliable)
+      if (tty) {
+        const focusByTtyScript = `
+          tell application "iTerm2"
+            activate
+            set targetTTY to "${tty}"
+
+            repeat with winIndex from 1 to count of windows
+              set w to window winIndex
+              repeat with tabIndex from 1 to count of tabs of w
+                set t to tab tabIndex of w
+                try
+                  set sess to current session of t
+                  set sessTTY to tty of sess
+                  if sessTTY is targetTTY then
+                    set index of w to 1
+                    select t
+                    activate
+                    return "focused:" & (name of sess)
+                  end if
+                end try
+              end repeat
+            end repeat
+
+            return "not_found"
+          end tell
+        `;
+
+        const ttyFocusResult = execSync(`osascript -e '${focusByTtyScript.replace(/'/g, "'\"'\"'")}'`, {
+          encoding: 'utf-8',
+          timeout: 5000,
+        }).trim();
+
+        if (ttyFocusResult.startsWith('focused:')) {
+          const foundName = ttyFocusResult.substring(8);
+          res.json({ success: true, focused: true, message: `Focused existing tab: ${foundName}` });
+          return;
+        }
+      }
+
+      // Focus existing tab by session name - check multiple properties:
+      // 1. Session name (set programmatically when tab created)
+      // 2. Session variable "user.session_name" (custom variable we set)
+      // 3. Window title (may be changed by shell/process)
+      // 4. Tab title (iTerm's tab label)
+      const focusScript = `
+        tell application "iTerm2"
+          activate
+          set targetName to "${sessionName}"
+
+          -- Search through all windows and tabs
+          repeat with winIndex from 1 to count of windows
+            set w to window winIndex
+            repeat with tabIndex from 1 to count of tabs of w
+              set t to tab tabIndex of w
+              try
+                set sess to current session of t
+                set sessName to name of sess
+
+                -- Check session name (our primary identifier)
+                if sessName contains targetName then
+                  -- Focus the window first
+                  set index of w to 1
+                  -- Then select the tab
+                  select t
+                  -- Bring iTerm to front
+                  activate
+                  return "focused:" & sessName
+                end if
+
+                -- Also check the tty path which might contain our identifier
+                -- This helps when session name gets overwritten by shell
+                try
+                  set ttyPath to tty of sess
+                  if ttyPath contains targetName then
+                    set index of w to 1
+                    select t
+                    activate
+                    return "focused:" & sessName
+                  end if
+                end try
+              end try
+            end repeat
+          end repeat
+
+          return "not_found"
+        end tell
+      `;
+
+      const focusResult = execSync(`osascript -e '${focusScript.replace(/'/g, "'\"'\"'")}'`, {
+        encoding: 'utf-8',
+        timeout: 5000,
+      }).trim();
+
+      if (focusResult.startsWith('focused:')) {
+        const foundName = focusResult.substring(8);
+        res.json({ success: true, focused: true, message: `Focused existing tab: ${foundName}` });
+        return;
+      }
+
+      // Tab not found, create a new one
+      // Use both session name AND a custom variable for reliable detection
+      const createScript = `
+        tell application "iTerm2"
+          activate
+          if (count of windows) = 0 then
+            create window with default profile
+          end if
+          tell current window
+            create tab with default profile
+            tell current session
+              -- Set the session name (primary identifier)
+              set name to "${sessionName}"
+              -- Set a custom variable for backup identification
+              set variable named "user.spellbook_session" to "${sessionName}"
+              -- Navigate and run command
+              write text "cd '${dir}' && ${cmd}"
+            end tell
+          end tell
+        end tell
+      `;
+
+      execSync(`osascript -e '${createScript.replace(/'/g, "'\"'\"'")}'`, {
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+
+      res.json({ success: true, focused: false, message: `Created new tab: ${sessionName}` });
+    } catch (err: any) {
+      console.error('[iTerm] Failed to open/focus:', err);
+      res.status(500).json({ error: `iTerm error: ${err.message}` });
+    }
+  });
+
+  // API: List ALL iTerm sessions and detect which ones have Claude running
+  app.get('/api/iterm/sessions', (_req: Request, res: Response) => {
+    try {
+      // Get ALL iTerm sessions with their names and TTYs
+      const listScript = `
+        tell application "iTerm2"
+          set output to ""
+          repeat with w in windows
+            repeat with t in tabs of w
+              try
+                set sess to current session of t
+                set sessName to name of sess
+                set sessTTY to tty of sess
+                set output to output & sessName & "|" & sessTTY & linefeed
+              end try
+            end repeat
+          end repeat
+          return output
+        end tell
+      `;
+
+      const result = execSync(`osascript -e '${listScript.replace(/'/g, "'\"'\"'")}'`, {
+        encoding: 'utf-8',
+        timeout: 5000,
+      }).trim();
+
+      // Parse the output into session objects
+      const lines = result.split('\n').filter(Boolean);
+      const sessions: Array<{
+        name: string;
+        tty: string;
+        hasClaude: boolean;
+        matchedItem: string | null;
+      }> = [];
+
+      for (const line of lines) {
+        const [name, tty] = line.split('|');
+        if (!name || !tty) continue;
+
+        // Check if Claude is running on this TTY
+        // iTerm returns "/dev/ttys006" but ps needs "ttys006"
+        const ttyName = tty.replace('/dev/', '');
+        let hasClaude = false;
+        try {
+          const psResult = execSync(`ps -t ${ttyName} -o comm 2>/dev/null | grep -q claude && echo "yes" || echo "no"`, {
+            encoding: 'utf-8',
+            timeout: 2000,
+          }).trim();
+          hasClaude = psResult === 'yes';
+        } catch {
+          // ps command failed, assume no Claude
+          hasClaude = false;
+        }
+
+        // Try to match session name to a work item using flexible patterns
+        const matchedItem = extractWorkItemReference(name);
+
+        sessions.push({
+          name,
+          tty,
+          hasClaude,
+          matchedItem,
+        });
+      }
+
+      res.json({ success: true, sessions });
+    } catch (err: any) {
+      console.error('[iTerm] Failed to list sessions:', err);
+      res.json({ success: true, sessions: [], error: err.message });
+    }
+  });
+
+  // Helper: Extract work item reference from session name using flexible pattern matching
+  function extractWorkItemReference(sessionName: string): string | null {
+    // Patterns to match: "Bug 79", "bug-79", "bug_79", "bug79", etc.
+    const patterns = [
+      { regex: /bug[\s\-_]?(\d+)/i, prefix: 'bug' },
+      { regex: /improvement[\s\-_]?(\d+)/i, prefix: 'improvement' },
+      { regex: /feature[\s\-_]?(\d+)/i, prefix: 'feature' },
+    ];
+
+    for (const { regex, prefix } of patterns) {
+      const match = sessionName.match(regex);
+      if (match && match[1]) {
+        return `${prefix}-${match[1]}`;
+      }
+    }
+
+    return null;
+  }
 
   // ============================================
   // Configuration APIs (MCP, ENV status)
@@ -1599,6 +3126,90 @@ export function createServer(config: BoardConfig) {
     } catch (err) {
       console.error('Failed to check security:', err);
       res.status(500).json({ error: 'Failed to check security status' });
+    }
+  });
+
+  // ============================================
+  // File Upload APIs
+  // ============================================
+
+  // API: Upload a file
+  app.post('/api/upload', upload.single('file'), (req: Request, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ error: 'No file provided' });
+      return;
+    }
+
+    const filePath = join(uploadDir, req.file.filename);
+
+    res.status(201).json({
+      success: true,
+      path: filePath,
+      filename: req.file.originalname,
+      savedAs: req.file.filename,
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+    });
+  });
+
+  // API: List recent uploads
+  app.get('/api/uploads', (_req: Request, res: Response) => {
+    try {
+      if (!existsSync(uploadDir)) {
+        res.json({ uploads: [] });
+        return;
+      }
+
+      const files = readdirSync(uploadDir)
+        .map(filename => {
+          const filePath = join(uploadDir, filename);
+          const stat = statSync(filePath);
+          return {
+            filename,
+            path: filePath,
+            size: stat.size,
+            createdAt: stat.birthtime.toISOString(),
+            modifiedAt: stat.mtime.toISOString(),
+          };
+        })
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, 50); // Limit to 50 most recent
+
+      res.json({ uploads: files, directory: uploadDir });
+    } catch (err) {
+      console.error('Failed to list uploads:', err);
+      res.status(500).json({ error: 'Failed to list uploads' });
+    }
+  });
+
+  // API: Delete an uploaded file
+  app.delete('/api/uploads/:filename', (req: Request, res: Response) => {
+    const filename = req.params.filename as string;
+
+    if (!filename) {
+      res.status(400).json({ error: 'Filename is required' });
+      return;
+    }
+
+    // Security: prevent path traversal
+    if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+      res.status(400).json({ error: 'Invalid filename' });
+      return;
+    }
+
+    const filePath = join(uploadDir, filename);
+
+    if (!existsSync(filePath)) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    try {
+      unlinkSync(filePath);
+      res.json({ success: true, deleted: filename });
+    } catch (err) {
+      console.error('Failed to delete file:', err);
+      res.status(500).json({ error: 'Failed to delete file' });
     }
   });
 
