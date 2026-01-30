@@ -2972,8 +2972,8 @@ export function createServer(config: BoardConfig) {
         timeout: 5000,
       });
 
-      // Schedule a delayed rename to override any title changes from Claude
-      // This runs after Claude has started and potentially changed the title
+      // Schedule a delayed /rename command to be sent to Claude after it starts
+      // This sends the Claude Code /rename command to set the session name
       setTimeout(() => {
         try {
           const renameScript = `
@@ -2985,8 +2985,11 @@ export function createServer(config: BoardConfig) {
                     -- Check if this is our session by the custom variable
                     set spellbookSession to variable named "user.spellbook_session" of sess
                     if spellbookSession is "${sessionName}" then
-                      set name of sess to "${sessionName}"
-                      return "renamed"
+                      -- Send /rename command to Claude
+                      tell sess
+                        write text "/rename ${sessionName}"
+                      end tell
+                      return "sent"
                     end if
                   end try
                 end repeat
@@ -2999,9 +3002,9 @@ export function createServer(config: BoardConfig) {
             timeout: 3000,
           });
         } catch (err) {
-          console.warn('[iTerm] Delayed rename failed:', err);
+          console.warn('[iTerm] Delayed /rename command failed:', err);
         }
-      }, 2000); // 2 second delay to let Claude start
+      }, 4000); // 4 second delay to let Claude fully start
 
       res.json({ success: true, focused: false, message: `Created new tab: ${sessionName}` });
     } catch (err: any) {
