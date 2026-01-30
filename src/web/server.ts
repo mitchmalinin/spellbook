@@ -2968,6 +2968,37 @@ export function createServer(config: BoardConfig) {
         timeout: 5000,
       });
 
+      // Schedule a delayed rename to override any title changes from Claude
+      // This runs after Claude has started and potentially changed the title
+      setTimeout(() => {
+        try {
+          const renameScript = `
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  try
+                    set sess to current session of t
+                    -- Check if this is our session by the custom variable
+                    set spellbookSession to variable named "user.spellbook_session" of sess
+                    if spellbookSession is "${sessionName}" then
+                      set name of sess to "${sessionName}"
+                      return "renamed"
+                    end if
+                  end try
+                end repeat
+              end repeat
+              return "not_found"
+            end tell
+          `;
+          execSync(`osascript -e '${renameScript.replace(/'/g, "'\"'\"'")}'`, {
+            encoding: 'utf-8',
+            timeout: 3000,
+          });
+        } catch (err) {
+          console.warn('[iTerm] Delayed rename failed:', err);
+        }
+      }, 2000); // 2 second delay to let Claude start
+
       res.json({ success: true, focused: false, message: `Created new tab: ${sessionName}` });
     } catch (err: any) {
       console.error('[iTerm] Failed to open/focus:', err);
