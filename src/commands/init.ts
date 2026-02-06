@@ -87,10 +87,8 @@ export const initCommand = new Command('init')
 
         // Create directory structure
         const dirs = [
-          'docs/bugs/active',
-          'docs/bugs/resolved',
-          'docs/improvements/active',
-          'docs/improvements/completed',
+          'docs/bugs',
+          'docs/improvements',
           'docs/features',
           'docs/knowledge/architecture',
           'docs/knowledge/decisions',
@@ -561,7 +559,7 @@ Extract type and number from the reference (e.g., "bug-44").
 spellbook status --json | jq '.bugs[] | select(.number == 44)'
 \`\`\`
 
-Read the corresponding markdown file from \`docs/bugs/active/\` or \`docs/improvements/active/\`.
+Read the corresponding markdown file from \`docs/bugs/\` or \`docs/improvements/\`.
 
 ### 3. Mark In Progress
 \`\`\`bash

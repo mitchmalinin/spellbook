@@ -294,7 +294,7 @@ ${featureRows || '_No features defined._'}
 
 ## 🔧 Active Improvements
 
-Tech debt, refactors, and enhancements. Individual files in \`improvements/active/\`.
+Tech debt, refactors, and enhancements.
 
 | #   | Improvement                                                                                                   | Priority | Linked Feature | Status |
 | --- | ------------------------------------------------------------------------------------------------------------- | -------- | -------------- | ------ |
@@ -310,7 +310,7 @@ ${improvementRows || '_No active improvements._'}
 
 ## 🐛 Active Bugs
 
-Individual bug files in \`bugs/active/\`.
+Tracked bug reports and fixes.
 
 | #   | Bug                                                                                | Priority | Status |
 | --- | ---------------------------------------------------------------------------------- | -------- | ------ |

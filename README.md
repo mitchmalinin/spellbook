@@ -51,10 +51,8 @@ Running `spellbook init --full` sets up everything in your project:
 
 ```
 docs/
-├── bugs/active/          # Active bug specs
-├── bugs/resolved/        # Resolved bugs
-├── improvements/active/  # Active improvement specs
-├── improvements/completed/
+├── bugs/                 # Bug specs
+├── improvements/         # Improvement specs
 ├── features/             # Feature specs
 └── knowledge/
     ├── architecture/     # Architecture docs
