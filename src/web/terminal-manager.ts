@@ -1,14 +1,31 @@
-import * as pty from 'node-pty';
 import { WebSocket, WebSocketServer } from 'ws';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
 import type { Server } from 'http';
 
+// Dynamic import of node-pty (optional dependency)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let ptyModule: Record<string, any> | null = null;
+try {
+  ptyModule = await import('node-pty');
+} catch {
+  console.warn('[TerminalManager] node-pty not available. Embedded terminals disabled.');
+}
+
+interface IPtyProcess {
+  pid: number;
+  write(data: string): void;
+  resize(cols: number, rows: number): void;
+  kill(signal?: string): void;
+  onData: (callback: (data: string) => void) => { dispose(): void };
+  onExit: (callback: (e: { exitCode: number; signal?: number }) => void) => { dispose(): void };
+}
+
 export interface Terminal {
   id: string;
   name: string;
   cwd: string;
-  pty: pty.IPty;
+  pty: IPtyProcess;
   ws: WebSocket | null;
   status: 'running' | 'idle' | 'closed';
   pid: number;
@@ -55,6 +72,13 @@ export class TerminalManager {
   private tmuxAvailable: boolean | null = null;
   private readonly TMUX_SESSION_PREFIX = 'spellbook-';
   private readonly OUTPUT_BUFFER_MAX_LINES = 50; // Keep last 50 lines for preview
+
+  /**
+   * Check if node-pty is available
+   */
+  static isAvailable(): boolean {
+    return ptyModule !== null;
+  }
 
   /**
    * Check if tmux is available on the system
@@ -114,7 +138,7 @@ export class TerminalManager {
       }
 
       return sessions;
-    } catch (err) {
+    } catch {
       // No sessions exist or tmux server not running
       return [];
     }
@@ -280,9 +304,14 @@ export class TerminalManager {
               break;
 
             case 'resize':
-              // Resize PTY
-              if (msg.cols && msg.rows) {
-                terminal.pty.resize(msg.cols, msg.rows);
+              // Resize PTY (only if terminal is still running)
+              if (msg.cols && msg.rows && terminal.status !== 'closed') {
+                try {
+                  terminal.pty.resize(msg.cols, msg.rows);
+                } catch (resizeErr) {
+                  // PTY may have closed - ignore resize errors
+                  console.warn(`[TerminalManager] Resize failed for ${terminalId}, PTY may be closed`);
+                }
               }
               break;
 
@@ -318,6 +347,10 @@ export class TerminalManager {
    * Create a new terminal
    */
   create(options: CreateTerminalOptions): Terminal {
+    if (!ptyModule) {
+      throw new Error('node-pty is not available. Install it with: npm install node-pty');
+    }
+
     const id = randomUUID();
     const shell = process.env.SHELL || '/bin/bash';
 
@@ -343,7 +376,7 @@ export class TerminalManager {
       SPELLBOOK_TERMINAL: id,
     };
 
-    let ptyProcess: pty.IPty;
+    let ptyProcess: IPtyProcess;
     let tmuxSession: string | undefined;
 
     if (useTmux) {
@@ -360,7 +393,7 @@ export class TerminalManager {
 
       // Create tmux session with the wrapped command
       // Use new-session with -d to create detached, then attach
-      ptyProcess = pty.spawn('tmux', [
+      ptyProcess = ptyModule.spawn('tmux', [
         'new-session',
         '-d',          // Start detached
         '-s', fullTmuxName,
@@ -399,7 +432,7 @@ export class TerminalManager {
       setTimeout(() => {
         const terminal = this.terminals.get(id);
         if (terminal) {
-          const attachProcess = pty.spawn('tmux', [
+          const attachProcess = ptyModule.spawn('tmux', [
             'attach-session',
             '-t', fullTmuxName,
           ], {
@@ -421,7 +454,7 @@ export class TerminalManager {
       console.log(`[TerminalManager] Created tmux session: ${fullTmuxName}`);
     } else {
       // Standard PTY without tmux
-      ptyProcess = pty.spawn(command, args, {
+      ptyProcess = ptyModule.spawn(command, args, {
         name: 'xterm-256color',
         cols: 120,
         rows: 30,
@@ -457,7 +490,7 @@ export class TerminalManager {
   /**
    * Set up PTY event handlers for a terminal
    */
-  private setupPtyHandlers(terminal: Terminal, ptyProcess: pty.IPty): void {
+  private setupPtyHandlers(terminal: Terminal, ptyProcess: IPtyProcess): void {
     // Forward PTY output to WebSocket
     ptyProcess.onData((data) => {
       terminal.lastActivity = new Date();
@@ -493,6 +526,10 @@ export class TerminalManager {
    * Reconnect to an existing tmux session
    */
   reconnect(sessionName: string, cwd: string, env?: Record<string, string>): Terminal | null {
+    if (!ptyModule) {
+      throw new Error('node-pty is not available. Install it with: npm install node-pty');
+    }
+
     if (!this.isTmuxAvailable()) {
       console.log('[TerminalManager] Cannot reconnect: tmux not available');
       return null;
@@ -525,7 +562,7 @@ export class TerminalManager {
       // Ignore if setting fails
     }
 
-    const ptyProcess = pty.spawn('tmux', [
+    const ptyProcess: IPtyProcess = ptyModule.spawn('tmux', [
       'attach-session',
       '-t', fullTmuxName,
     ], {

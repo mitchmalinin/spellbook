@@ -3,6 +3,17 @@
 
 const API_BASE = '/api';
 
+// ==================== TYPE LOOKUP MAPS ====================
+
+/** Maps item type to its plural API endpoint name */
+const TYPE_TO_ENDPOINT = { bug: 'bugs', improvement: 'improvements', feature: 'features' };
+
+/** Maps item type to its "done" status value */
+const TYPE_TO_DONE_STATUS = { bug: 'resolved', improvement: 'completed', feature: 'complete' };
+
+/** Maps item type to its branch prefix */
+const TYPE_TO_BRANCH_PREFIX = { bug: 'fix', improvement: 'improvement', feature: 'feature' };
+
 // ==================== PERFORMANCE CONFIGURATION ====================
 
 const PERF_CONFIG = {
@@ -364,7 +375,7 @@ const state = {
   inbox: [],
   kanbanFilter: 'all',
   kanbanPriorityFilter: 'all',
-  kanbanSort: 'priority',
+  kanbanSort: 'newest',
   kanbanSearch: '',
   inboxFilter: 'all',
   selectedInboxItem: null,
@@ -1021,7 +1032,9 @@ async function loadMainComparison() {
       if (pullMainBtn) pullMainBtn.classList.add('hidden');
     } else if (developBehindMain > 0 && developAheadOfMain === 0) {
       // Only behind - need to pull main
-      const severity = developBehindMain > 10 ? 'red' : developBehindMain > 3 ? 'yellow' : 'blue';
+      let severity = 'blue';
+      if (developBehindMain > 10) severity = 'red';
+      else if (developBehindMain > 3) severity = 'yellow';
       dot.className = `w-2 h-2 rounded-full bg-${severity}-500`;
       text.textContent = `↓${developBehindMain} behind`;
       text.className = `text-${severity}-400`;
@@ -2493,7 +2506,7 @@ function renderInvestigationSessions() {
     const session = investigations.sessions[id];
     const isActive = investigations.activeSession === id;
     const statusColor = session.status === 'active' ? 'text-green-400' : 'text-spellbook-muted';
-    const typeIcon = session.type === 'bug' ? '🐛' : session.type === 'research' ? '🔍' : '❓';
+    const typeIcon = { bug: '🐛', research: '🔍' }[session.type] || '❓';
 
     return `
       <div class="bg-spellbook-card border ${isActive ? 'border-spellbook-accent' : 'border-spellbook-border'} rounded-lg p-3 cursor-pointer hover:border-spellbook-accent transition-colors"
@@ -2843,7 +2856,7 @@ function showWorkModeModal(type, number, item) {
   itemRef.textContent = ref;
 
   // Generate default branch name
-  const branchPrefix = type === 'bug' ? 'fix' : type === 'feature' ? 'feature' : 'improvement';
+  const branchPrefix = TYPE_TO_BRANCH_PREFIX[type] || 'improvement';
   const slug = modal.dataset.itemSlug;
   const defaultBranch = `${branchPrefix}/${number}-${slug}`;
   branchInput.value = defaultBranch;
@@ -3072,12 +3085,13 @@ async function submitWorkMode() {
     // Get worktree options
     const branchName = document.getElementById('worktree-branch-name').value;
     const installDeps = document.getElementById('worktree-install-deps')?.checked ?? true;
+    const aiTool = modal.querySelector('input[name="ai-tool"]:checked')?.value || 'claude';
 
     // Show progress modal
     showWorktreeProgressModal(type, number, branchName);
 
     // Create worktree with full setup (opens in built-in web terminal, not external)
-    await createWorktreeAndOpenPlanning(type, number, branchName, { installDeps });
+    await createWorktreeAndOpenPlanning(type, number, branchName, { installDeps, aiTool });
   } else {
     // Open planning view directly (work on develop)
     openPlanningView(type, number);
@@ -3085,7 +3099,7 @@ async function submitWorkMode() {
 }
 
 async function createWorktreeAndOpenPlanning(type, number, branchName, options = {}) {
-  const { installDeps = true } = options;
+  const { installDeps = true, aiTool = 'claude' } = options;
   // Never launch external terminal - we'll open in the built-in web terminal via openPlanningView
   const launchTerminal = false;
   const ref = `${type}-${number}`;
@@ -3136,6 +3150,7 @@ async function createWorktreeAndOpenPlanning(type, number, branchName, options =
         task: task,
         installDeps: installDeps,
         launchTerminal: launchTerminal,
+        aiTool: aiTool,
       }),
     });
 
@@ -3204,7 +3219,7 @@ async function createWorktreeAndOpenPlanning(type, number, branchName, options =
 
     // Update item status to in_progress
     try {
-      const endpoint = type === 'bug' ? 'bugs' : type === 'improvement' ? 'improvements' : 'features';
+      const endpoint = TYPE_TO_ENDPOINT[type] || 'features';
       await fetch(`${API_BASE}/${endpoint}/${number}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -3240,10 +3255,10 @@ async function quickFinalize() {
   }
 
   const { type, number } = currentDetailItem;
-  const newStatus = type === 'bug' ? 'resolved' : type === 'improvement' ? 'completed' : 'complete';
+  const newStatus = TYPE_TO_DONE_STATUS[type] || 'complete';
 
   try {
-    const endpoint = type === 'bug' ? 'bugs' : type === 'improvement' ? 'improvements' : 'features';
+    const endpoint = TYPE_TO_ENDPOINT[type] || 'features';
 
     debugLog(`Updating ${endpoint}/${number} to status: ${newStatus}`);
 
@@ -3406,13 +3421,16 @@ async function savePlanFile(type, number, content) {
 }
 
 // Update the plan indicator in UI
+// Note: Plans are created in Claude Code's plan mode, not saved to files
+// So we just show status based on what the scribe has documented
 function updatePlanIndicator(exists) {
   const indicator = document.getElementById('plan-status-indicator');
   if (indicator) {
     if (exists) {
-      indicator.innerHTML = '<span class="text-green-400">✓ Plan exists</span>';
+      indicator.innerHTML = '<span class="text-green-400">✓ Plan documented</span>';
     } else {
-      indicator.innerHTML = '<span class="text-yellow-400">⚠ No plan yet</span>';
+      // Don't show warning - plans are in Claude context, not files
+      indicator.innerHTML = '';
     }
   }
 }
@@ -4086,12 +4104,13 @@ function renderDiff(diff) {
   }).join('\n');
 }
 
-// ==================== iTERM INTEGRATION ====================
+// ==================== TERMINAL INTEGRATION ====================
 
 /**
- * Open or focus iTerm tab for current planning session
+ * Open or focus terminal tab for current planning session
+ * Uses the user's configured terminal (Ghostty/iTerm)
  */
-async function openInIterm() {
+async function openInTerminal() {
   const sessionKey = sessions.activePlanningSession;
   if (!sessionKey) {
     showToast('error', 'No active session');
@@ -4102,7 +4121,7 @@ async function openInIterm() {
   const worktreePath = session?.worktreePath || state.projectPath;
 
   try {
-    const res = await fetch(`${API_BASE}/iterm/open`, {
+    const res = await fetch(`${API_BASE}/terminal/open`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -4116,18 +4135,21 @@ async function openInIterm() {
 
     if (result.success) {
       if (result.focused) {
-        showToast('success', `Focused existing iTerm tab: ${sessionKey}`);
+        showToast('success', `Focused existing terminal: ${sessionKey}`);
       } else {
-        showToast('success', `Opened new iTerm tab: ${sessionKey}`);
+        showToast('success', `Opened new terminal: ${sessionKey}`);
       }
     } else {
-      showToast('error', result.error || 'Failed to open iTerm');
+      showToast('error', result.error || 'Failed to open terminal');
     }
   } catch (err) {
-    console.error('Failed to open iTerm:', err);
-    showToast('error', `Failed to open iTerm: ${err.message}`);
+    console.error('Failed to open terminal:', err);
+    showToast('error', `Failed to open terminal: ${err.message}`);
   }
 }
+
+// Backwards compatibility alias
+const openInIterm = openInTerminal;
 
 function minimizePlanningView() {
   const sessionKey = sessions.activePlanningSession;
@@ -4727,13 +4749,16 @@ function renderSessionPills() {
     const matchedItem = session.matchedItem;
     const displayName = matchedItem || sessionName;
     const statusColor = session.hasClaude ? 'text-green-400' : 'text-gray-400';
+    const isFocused = session.isFocused === true;
+    const focusedClasses = isFocused ? 'ring-1 ring-yellow-400 bg-yellow-400/10' : 'bg-spellbook-card';
 
     return `
       <button onclick="handleSessionPillClick('${escapeHtml(sessionName)}', '${escapeHtml(tty)}', '${escapeHtml(matchedItem || '')}')"
-              class="px-2 py-0.5 text-xs rounded flex items-center gap-1 bg-spellbook-card hover:bg-spellbook-border group"
-              title="Click to focus iTerm, Shift+Click for docs">
+              class="px-2 py-0.5 text-xs rounded flex items-center gap-1 ${focusedClasses} hover:bg-spellbook-border group"
+              title="${isFocused ? '⚡ Currently focused - ' : ''}Click to focus iTerm, Shift+Click for docs">
         <span class="${statusColor}">●</span>
         ${escapeHtml(displayName)}
+        ${isFocused ? '<span class="text-yellow-400 text-[10px]">⚡</span>' : ''}
       </button>
     `;
   }).join('');
@@ -4772,7 +4797,7 @@ function startItermSessionsRefresh() {
  */
 async function refreshItermSessionsForPills() {
   try {
-    const res = await fetch(`${API_BASE}/iterm/sessions`);
+    const res = await fetch(`${API_BASE}/terminal/sessions`);
     const data = await res.json();
     itermSessions = data.sessions || [];
   } catch (err) {
@@ -4911,17 +4936,17 @@ function stopPreviewRefresh() {
 let itermSessions = [];
 
 /**
- * Fetch and render iTerm sessions
+ * Fetch and render terminal sessions (works with Ghostty and iTerm)
  */
 async function refreshItermSessions() {
   const container = document.getElementById('sessions-grid');
 
   try {
-    const res = await fetch(`${API_BASE}/iterm/sessions`);
+    const res = await fetch(`${API_BASE}/terminal/sessions`);
     const data = await res.json();
     itermSessions = data.sessions || [];
   } catch (err) {
-    console.error('Failed to fetch iTerm sessions:', err);
+    console.error('Failed to fetch terminal sessions:', err);
     itermSessions = [];
   }
 
@@ -4935,18 +4960,19 @@ function renderItermSessionsGrid() {
   if (itermSessions.length === 0) {
     container.innerHTML = `
       <div class="text-center text-spellbook-muted py-8 col-span-4">
-        No active iTerm sessions detected. Click "Work on this" on an item to start.
+        No active terminal sessions detected. Click "Work on this" on an item to start.
       </div>
     `;
     return;
   }
 
   container.innerHTML = itermSessions.map(session => {
-    // Session is now an object: { name, tty, hasClaude, matchedItem }
+    // Session is now an object: { name, tty, hasClaude, matchedItem, isFocused }
     const sessionName = session.name || session; // Handle both old string format and new object format
     const tty = session.tty || '';
     const hasClaude = session.hasClaude !== false;
     const matchedItem = session.matchedItem;
+    const isFocused = session.isFocused === true;
 
     // Try to find the item in state
     let item = null;
@@ -4966,11 +4992,16 @@ function renderItermSessionsGrid() {
     const statusIndicator = hasClaude ? '● Claude running' : '○ No Claude';
     const statusColor = hasClaude ? 'text-green-400' : 'text-gray-400';
     const itemRef = matchedItem || 'unlinked';
+    const focusedBorder = isFocused ? 'border-yellow-400 ring-2 ring-yellow-400/30' : 'border-spellbook-border';
+    const focusedBadge = isFocused ? '<span class="px-1.5 py-0.5 text-[10px] bg-yellow-400/20 text-yellow-400 rounded font-medium">ACTIVE</span>' : '';
 
     return `
-      <div class="bg-spellbook-card border border-spellbook-border rounded-lg p-3 hover:border-spellbook-accent transition-colors">
+      <div class="bg-spellbook-card border ${focusedBorder} rounded-lg p-3 hover:border-spellbook-accent transition-colors">
         <div class="flex items-center justify-between mb-2">
-          <span class="font-semibold text-spellbook-accent">${escapeHtml(sessionName)}</span>
+          <div class="flex items-center gap-2">
+            <span class="font-semibold text-spellbook-accent">${escapeHtml(sessionName)}</span>
+            ${focusedBadge}
+          </div>
           <span class="text-xs ${statusColor}">${statusIndicator}</span>
         </div>
         <div class="text-xs text-spellbook-muted mb-1">
@@ -4997,25 +5028,30 @@ function renderItermSessionsGrid() {
 }
 
 /**
- * Focus an iTerm session by name or TTY
+ * Focus a terminal session by name or TTY
+ * Uses the user's configured terminal (Ghostty/iTerm)
  */
-async function focusItermSession(sessionName, tty = '') {
+async function focusTerminalSession(sessionName, tty = '') {
   try {
-    const res = await fetch(`${API_BASE}/iterm/open`, {
+    // Use focus endpoint which brings terminal to front without opening new window
+    const res = await fetch(`${API_BASE}/terminal/focus`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionName, tty }),
     });
     const result = await res.json();
     if (result.success) {
-      showToast('success', `Focused iTerm: ${sessionName}`);
+      showToast('success', `Focused terminal: ${sessionName}`);
     } else {
-      showToast('error', result.error || 'Failed to focus iTerm');
+      showToast('error', result.error || 'Failed to focus terminal');
     }
   } catch (err) {
     showToast('error', `Error: ${err.message}`);
   }
 }
+
+// Backwards compatibility alias
+const focusItermSession = focusTerminalSession;
 
 /**
  * View documentation for a session (accepts matched item reference like "bug-79")
@@ -5397,14 +5433,14 @@ async function handleDrop(event, targetColumn) {
     backlog: 'active',
     planning: 'planning',
     progress: 'in_progress',
-    done: type === 'bug' ? 'resolved' : type === 'improvement' ? 'completed' : 'complete',
+    done: TYPE_TO_DONE_STATUS[type] || 'complete',
   };
 
   const newStatus = statusMap[targetColumn];
   if (!newStatus) return;
 
   try {
-    const endpoint = type === 'bug' ? 'bugs' : type === 'improvement' ? 'improvements' : 'features';
+    const endpoint = TYPE_TO_ENDPOINT[type] || 'features';
     await fetch(`${API_BASE}/${endpoint}/${number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -5664,31 +5700,32 @@ async function closeWorktree(path) {
   updateActivity(`Prepared worktree cleanup: ${path.split('/').slice(-2).join('/')}`);
 }
 
-// Open terminal in worktree directory
+// Open terminal in worktree directory (uses external terminal based on config - Ghostty/iTerm)
+// Does NOT pass a hardcoded command - lets the server use the configured AI tool
 async function openWorktreeInTerminal(path) {
   try {
-    // Create a new terminal at the worktree path
-    const res = await fetch(`${API_BASE}/terminals`, {
+    // Use the generic terminal endpoint which respects the user's terminal config
+    const sessionName = path.split('/').slice(-2).join('/');
+    const res = await fetch(`${API_BASE}/terminal/open`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        cwd: path,
-        name: `WT: ${path.split('/').slice(-2).join('/')}`,
+        sessionName: sessionName,
+        workingDir: path,
       }),
     });
 
     if (!res.ok) {
-      throw new Error('Failed to create terminal');
+      const error = await res.json();
+      throw new Error(error.error || 'Failed to open terminal');
     }
 
     const data = await res.json();
-
-    // Switch to terminals view
-    switchMainView('terminals');
-    updateActivity(`Opened terminal at: ${path.split('/').slice(-2).join('/')}`);
+    showToast('success', data.message || `Opened terminal: ${sessionName}`);
+    updateActivity(`Opened terminal at: ${sessionName}`);
   } catch (err) {
     console.error('Failed to open terminal:', err);
-    alert(`Failed to open terminal: ${err.message}`);
+    showToast('error', `Failed to open terminal: ${err.message}`);
   }
 }
 

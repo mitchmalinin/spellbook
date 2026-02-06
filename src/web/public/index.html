@@ -5,36 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Spellbook - Mission Control</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="vendor/tailwind.css">
+  <script src="vendor/marked.min.js"></script>
   <!-- xterm.js for terminal emulation -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
-  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <script src="vendor/xterm.min.js"></script>
+  <script src="vendor/xterm-addon-fit.min.js"></script>
+  <script src="vendor/xterm-addon-web-links.min.js"></script>
   <link rel="stylesheet" href="styles.css">
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            spellbook: {
-              bg: '#0a0a0f',
-              card: '#14141f',
-              border: '#1f1f2e',
-              accent: '#00ff88',
-              text: '#e0e0e0',
-              muted: '#666680',
-            }
-          },
-          fontFamily: {
-            mono: ['Space Mono', 'Menlo', 'Monaco', 'monospace'],
-          }
-        }
-      }
-    }
-  </script>
 </head>
 <body class="dark bg-spellbook-bg text-spellbook-text font-mono min-h-screen">
   <div id="app" class="flex h-screen">
@@ -385,45 +363,50 @@
         <!-- LEFT: Kanban Board (2/3) -->
         <div id="kanban-panel" class="border-r border-spellbook-border flex flex-col">
           <!-- Kanban Header -->
-          <div class="px-4 py-2 border-b border-spellbook-border flex items-center justify-between">
-            <div class="flex items-center gap-4">
-              <span class="text-sm font-semibold">Kanban Board</span>
-              <!-- Type Filter -->
-              <div class="flex gap-1">
-                <button onclick="setKanbanFilter('all')" class="kanban-filter active" data-filter="all">All</button>
-                <button onclick="setKanbanFilter('bug')" class="kanban-filter" data-filter="bug">Bugs</button>
-                <button onclick="setKanbanFilter('improvement')" class="kanban-filter" data-filter="improvement">Improvements</button>
-                <button onclick="setKanbanFilter('feature')" class="kanban-filter" data-filter="feature">Features</button>
+          <div class="border-b border-spellbook-border">
+            <!-- Filter Row -->
+            <div class="px-4 py-2 flex items-center justify-between">
+              <div class="flex items-center gap-4">
+                <span class="text-sm font-semibold">Kanban Board</span>
+                <!-- Type Filter -->
+                <div class="flex gap-1">
+                  <button onclick="setKanbanFilter('all')" class="kanban-filter active" data-filter="all">All</button>
+                  <button onclick="setKanbanFilter('bug')" class="kanban-filter" data-filter="bug">Bugs</button>
+                  <button onclick="setKanbanFilter('improvement')" class="kanban-filter" data-filter="improvement">Improvements</button>
+                  <button onclick="setKanbanFilter('feature')" class="kanban-filter" data-filter="feature">Features</button>
+                </div>
+                <!-- Priority Filter -->
+                <select id="priority-filter" onchange="setKanbanPriorityFilter(this.value)" class="bg-spellbook-card border border-spellbook-border rounded px-2 py-1 text-xs">
+                  <option value="all">All Priorities</option>
+                  <option value="high">High Only</option>
+                  <option value="medium">Medium Only</option>
+                  <option value="low">Low Only</option>
+                </select>
+                <!-- Sort -->
+                <select id="kanban-sort" onchange="setKanbanSort(this.value)" class="bg-spellbook-card border border-spellbook-border rounded px-2 py-1 text-xs">
+                  <option value="newest" selected>Newest First</option>
+                  <option value="priority">By Priority</option>
+                  <option value="oldest">Oldest First</option>
+                  <option value="number">By Number</option>
+                </select>
               </div>
-              <!-- Priority Filter -->
-              <select id="priority-filter" onchange="setKanbanPriorityFilter(this.value)" class="bg-spellbook-card border border-spellbook-border rounded px-2 py-1 text-xs">
-                <option value="all">All Priorities</option>
-                <option value="high">High Only</option>
-                <option value="medium">Medium Only</option>
-                <option value="low">Low Only</option>
-              </select>
-              <!-- Sort -->
-              <select id="kanban-sort" onchange="setKanbanSort(this.value)" class="bg-spellbook-card border border-spellbook-border rounded px-2 py-1 text-xs">
-                <option value="priority">By Priority</option>
-                <option value="newest">Newest First</option>
-                <option value="oldest">Oldest First</option>
-                <option value="number">By Number</option>
-              </select>
-              <!-- Search -->
-              <div class="flex items-center gap-1">
-                <input type="text"
-                       id="kanban-search"
-                       placeholder="Search bugs, improvements..."
-                       class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-xs focus:border-spellbook-accent focus:outline-none w-48"
-                       oninput="handleKanbanSearch(this.value)">
-                <button onclick="clearKanbanSearch()" class="text-spellbook-muted hover:text-white text-sm px-1" title="Clear search">×</button>
+              <div class="flex items-center gap-2">
+                <span id="kanban-count" class="text-xs text-spellbook-muted"></span>
+                <button onclick="refreshKanban()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent" title="Refresh board">
+                  ↻ Refresh
+                </button>
               </div>
             </div>
-            <div class="flex items-center gap-2">
-              <span id="kanban-count" class="text-xs text-spellbook-muted"></span>
-              <button onclick="refreshKanban()" class="px-3 py-1 bg-spellbook-card border border-spellbook-border rounded text-sm hover:border-spellbook-accent" title="Refresh board">
-                ↻ Refresh
-              </button>
+            <!-- Search Row -->
+            <div class="px-4 py-2 border-t border-spellbook-border/50">
+              <div class="flex items-center gap-2">
+                <input type="text"
+                       id="kanban-search"
+                       placeholder="Search bugs, improvements, features..."
+                       class="flex-1 px-3 py-1.5 bg-spellbook-card border border-spellbook-border rounded text-xs focus:border-spellbook-accent focus:outline-none"
+                       oninput="handleKanbanSearch(this.value)">
+                <button onclick="clearKanbanSearch()" class="px-2 py-1 text-spellbook-muted hover:text-white text-sm border border-spellbook-border rounded hover:border-spellbook-accent" title="Clear search">Clear</button>
+              </div>
             </div>
           </div>
 
@@ -490,10 +473,10 @@
 
       <!-- TERMINAL MANAGER VIEW (Hidden by default) -->
       <div id="terminal-manager-view" class="flex-1 flex-col overflow-hidden hidden">
-        <!-- iTerm Sessions -->
+        <!-- Terminal Sessions -->
         <div class="p-4 border-b border-spellbook-border">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm font-semibold">Active iTerm Sessions</span>
+            <span class="text-sm font-semibold">Active Terminal Sessions</span>
             <div class="flex items-center gap-2">
               <button onclick="refreshItermSessions()" class="text-xs text-spellbook-muted hover:text-spellbook-accent">
                 ↻ Refresh
@@ -503,7 +486,7 @@
           <div id="sessions-grid" class="grid grid-cols-4 gap-3">
             <!-- Session cards rendered here -->
             <div class="text-center text-spellbook-muted py-8 col-span-4">
-              No active iTerm sessions detected. Click "Work on this" on an item to start.
+              No active terminal sessions detected. Click "Work on this" on an item to start.
             </div>
           </div>
         </div>
@@ -939,8 +922,25 @@
                 <span>Install dependencies</span>
               </label>
             </div>
+            <div class="mt-3">
+              <label class="block text-sm text-spellbook-muted mb-2">AI Tool</label>
+              <div class="flex gap-2">
+                <label class="flex-1 cursor-pointer">
+                  <input type="radio" name="ai-tool" value="claude" class="peer hidden" checked>
+                  <div class="p-2 rounded border border-spellbook-border text-center text-sm peer-checked:border-spellbook-accent peer-checked:bg-spellbook-accent/10 peer-checked:text-spellbook-accent transition-colors">
+                    Claude
+                  </div>
+                </label>
+                <label class="flex-1 cursor-pointer">
+                  <input type="radio" name="ai-tool" value="codex" class="peer hidden">
+                  <div class="p-2 rounded border border-spellbook-border text-center text-sm peer-checked:border-green-400 peer-checked:bg-green-400/10 peer-checked:text-green-400 transition-colors">
+                    Codex
+                  </div>
+                </label>
+              </div>
+            </div>
             <div class="text-xs text-spellbook-muted mt-2 p-2 bg-spellbook-card/50 rounded">
-              <strong>Full setup:</strong> Creates worktree, copies .env files, symlinks docs/knowledge, allocates ports, installs deps, and launches Claude agent.
+              <strong>Full setup:</strong> Creates worktree, copies .env files, symlinks docs/knowledge, allocates ports, installs deps, and launches AI agent.
             </div>
           </div>
         </div>
