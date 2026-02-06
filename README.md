@@ -20,6 +20,17 @@ npm link
 
 This makes the `spellbook` command available globally. `node-pty` is an optional dependency for embedded web terminals — if it fails to install (missing build tools), everything else works fine.
 
+## Updating
+
+```bash
+cd spellbook
+git pull
+npm install   # only needed if dependencies changed
+npm run build
+```
+
+`npm link` uses a symlink, so the global `spellbook` command always points at your local `dist/`. After pulling and rebuilding, the new code is live immediately.
+
 ## Quick Start
 
 ```bash
