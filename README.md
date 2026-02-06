@@ -11,10 +11,14 @@ Project planning CLI that integrates with Claude Code for AI-assisted developmen
 ## Install
 
 ```bash
-npm install -g @mrwzrd/spellbook
+git clone https://github.com/mitchmalinin/spellbook.git
+cd spellbook
+npm install
+npm run build
+npm link
 ```
 
-`node-pty` is an optional dependency for embedded web terminals. If it fails to install (missing build tools), everything else works fine — you just won't have inline terminals in the web board.
+This makes the `spellbook` command available globally. `node-pty` is an optional dependency for embedded web terminals — if it fails to install (missing build tools), everything else works fine.
 
 ## Quick Start
 
@@ -139,22 +143,15 @@ All frontend assets are bundled locally — no CDN dependencies, works fully off
 - **Config**: `.spellbook.yaml` in each project root
 - **Worktree registry**: `~/.claude/worktree-registry.json` — tracks active worktrees
 
-## Development
+## Build Pipeline
 
-```bash
-git clone https://github.com/mrwzrd/spellbook.git
-cd spellbook
-npm install
-npm run build    # Compiles CSS + TypeScript + copies public assets
-npm link         # Makes `spellbook` command available globally
-```
-
-The build pipeline:
 1. `build:css` — Tailwind CLI compiles CSS from `src/web/public/tailwind-input.css`
 2. `tsc` — TypeScript compilation
 3. `copy-public` — Copies `src/web/public/` to `dist/web/public/`
 
-### Project Structure
+Use `npm run dev` (tsc --watch) during development.
+
+## Project Structure
 
 ```
 src/
